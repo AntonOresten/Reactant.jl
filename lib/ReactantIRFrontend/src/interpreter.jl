@@ -81,24 +81,43 @@ function involves_reactant(@nospecialize(T))
     return false
 end
 
-function CC.src_inlining_policy(
-    interp::Interpreter,
-    @nospecialize(src),
-    @nospecialize(info::CC.CallInfo),
-    stmt_flag::UInt32,
-)
-    inlines_leaf(info) && return false
-    opaque_to_emitter(src) && return false
-    return @invoke CC.src_inlining_policy(
-        interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
-    )
-end
-
 # Host helpers such as `task_local_storage` bottom out in foreign calls, which
 # the emitter cannot interpret but can run natively as an out-of-line call. Keep
 # them, and anything with an exception handler, out of line. Sources must stay
 # uncompressed for the policy to see them.
 CC.may_compress(::Interpreter) = false
+
+function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
+    return inlines_leaf(info) || opaque_to_emitter(src)
+end
+
+# Julia 1.12 turned `inlining_policy`, which returns the source to inline or
+# `nothing`, into `src_inlining_policy`, which returns whether to inline.
+@static if isdefined(CC, :src_inlining_policy)
+    function CC.src_inlining_policy(
+        interp::Interpreter,
+        @nospecialize(src),
+        @nospecialize(info::CC.CallInfo),
+        stmt_flag::UInt32,
+    )
+        stays_out_of_line(src, info) && return false
+        return @invoke CC.src_inlining_policy(
+            interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
+        )
+    end
+else
+    function CC.inlining_policy(
+        interp::Interpreter,
+        @nospecialize(src),
+        @nospecialize(info::CC.CallInfo),
+        stmt_flag::UInt32,
+    )
+        stays_out_of_line(src, info) && return nothing
+        return @invoke CC.inlining_policy(
+            interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
+        )
+    end
+end
 
 function opaque_to_emitter(@nospecialize(src))
     stmts = if src isa Core.CodeInfo
@@ -114,14 +133,21 @@ function opaque_to_emitter(@nospecialize(src))
 end
 
 function inlines_leaf(info::CC.MethodMatchInfo)
-    return any(m -> isleaf(m.method, m.spec_types), info.results)
+    return any(m -> isleaf(m.method, m.spec_types), info.results.matches)
 end
-inlines_leaf(info::CC.UnionSplitInfo) = any(inlines_leaf, info.split)
+inlines_leaf(info::CC.UnionSplitInfo) = any(inlines_leaf, union_split(info))
 inlines_leaf(info::CC.ConstCallInfo) = inlines_leaf(info.call)
 inlines_leaf(info::CC.ApplyCallInfo) = inlines_leaf(info.call)
 inlines_leaf(info::CC.UnionSplitApplyCallInfo) = any(inlines_leaf, info.infos)
 inlines_leaf(info::CC.InvokeCallInfo) = isleaf(info.match.method, info.match.spec_types)
 inlines_leaf(@nospecialize(info::CC.CallInfo)) = false
+
+# Julia 1.12 renamed the field holding a union split's matches.
+@static if hasfield(CC.UnionSplitInfo, :split)
+    union_split(info::CC.UnionSplitInfo) = info.split
+else
+    union_split(info::CC.UnionSplitInfo) = info.matches
+end
 
 # Type a leaf call with Reactant's interpreter and stop there. Descending into
 # MLIR builders and Enzyme from this interpreter is wasted work and, for deep
@@ -147,8 +173,7 @@ function CC.abstract_call_method(
         if TracedRNumber{Bool} in Base.uniontypes(rt)
             rt = Union{rt,Bool}
         end
-        result = CC.MethodCallResult(rt, Any, CC.Effects(), nothing, false, false)
-        return CC.Future{CC.MethodCallResult}(result)
+        return deferred(leaf_call_result(rt))
     end
     return @invoke CC.abstract_call_method(
         interp::CC.AbstractInterpreter,
@@ -159,6 +184,20 @@ function CC.abstract_call_method(
         si::CC.StmtInfo,
         sv::CC.AbsIntState,
     )
+end
+
+# Julia 1.12 hands inference results around as `Future`s, and reordered the
+# fields of `MethodCallResult`.
+@static if isdefined(CC, :Future)
+    deferred(x::T) where {T} = CC.Future{T}(x)
+    function leaf_call_result(@nospecialize(rt))
+        return CC.MethodCallResult(rt, Any, CC.Effects(), nothing, false, false)
+    end
+else
+    deferred(x) = x
+    function leaf_call_result(@nospecialize(rt))
+        return CC.MethodCallResult(rt, Any, false, false, nothing, CC.Effects())
+    end
 end
 
 function leaf_return_type(@nospecialize(sig), world::UInt)
@@ -176,10 +215,9 @@ function CC.abstract_call_known(
     max_methods::Int=CC.get_max_methods(interp, f, sv),
 )
     if f === ReactantCore.within_compile && length(arginfo.argtypes) == 1
-        meta = CC.CallMeta(
-            Core.Const(true), Union{}, CC.EFFECTS_TOTAL, CC.MethodResultPure()
+        return deferred(
+            CC.CallMeta(Core.Const(true), Union{}, CC.EFFECTS_TOTAL, CC.MethodResultPure())
         )
-        return CC.Future{CC.CallMeta}(meta)
     end
     return @invoke CC.abstract_call_known(
         interp::CC.AbstractInterpreter,
