@@ -59,16 +59,31 @@ end
 
 file = isempty(ARGS) ? "control_flow" : only(ARGS)
 source = normpath(joinpath(@__DIR__, "..", "..", "..", "test", "core", file * ".jl"))
-suite = Test.DefaultTestSet("Reactant $(file).jl through structured"; verbose=false)
-Test.push_testset(suite)
-try
-    Base.include(Module(:Upstream), source)
-catch err
-    println("The file itself failed to load: ", sprint(showerror, err))
-finally
-    Test.pop_testset()
+
+# Julia 1.13 keeps the active testset in a scoped value instead of a stack.
+function within(f, ts::Test.AbstractTestSet)
+    @static if isdefined(Test, :push_testset)
+        Test.push_testset(ts)
+        try
+            return f()
+        finally
+            Test.pop_testset()
+        end
+    else
+        return Base.ScopedValues.with(
+            f, Test.CURRENT_TESTSET => ts, Test.TESTSET_DEPTH => 1
+        )
+    end
 end
-suite.time_end = time()
+
+suite = Test.DefaultTestSet("Reactant $(file).jl through structured"; verbose=false)
+within(suite) do
+    try
+        Base.include(Module(:Upstream), source)
+    catch err
+        println("The file itself failed to load: ", sprint(showerror, err))
+    end
+end
 
 function classify(result)
     result isa Test.Fail && return "mismatch"

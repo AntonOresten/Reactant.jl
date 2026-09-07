@@ -127,9 +127,9 @@ Reactant's own test files unchanged, `test/core/control_flow.jl` by default or
 `autodiff` when named as an argument, reporting what passes and why the rest
 does not.
 
-Requires Julia 1.11 or 1.12. The compiler interfaces that differ between the
-two (`Future`s, `MethodCallResult`, the inlining hook, where the valid worlds
-of an inference result live) are gated in `interpreter.jl` and `code.jl`. Julia
-1.11 also lowers `finally` to one shared body that dispatches on a state value;
+Requires Julia 1.11, 1.12 or 1.13. The compiler interfaces that changed in
+1.12 (`Future`s, `MethodCallResult`, the inlining hook, where the valid worlds
+of an inference result live) are gated in `interpreter.jl` and `code.jl`; 1.13
+needs nothing further. Julia 1.11 also lowers `finally` to one shared body that dispatches on a state value;
 once the handler is dropped that dispatch compares two literals and is decided
 before structurization, so its dead `rethrow` never becomes a loop exit.
