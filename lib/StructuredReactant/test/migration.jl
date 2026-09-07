@@ -1,9 +1,9 @@
 # How much of one of Reactant's own test files (`control_flow` by default, or
 # `autodiff`) passes with `@trace` on control flow made an identity macro and
 # every compilation routed through `structured`? Not part of the test suite:
-#     julia --project=lib/ReactantIRFrontend/test lib/ReactantIRFrontend/test/migration.jl [autodiff]
-using Reactant, ReactantIRFrontend, Test
-using ReactantIRFrontend: FrontendError
+#     julia --project=lib/StructuredReactant/test lib/StructuredReactant/test/migration.jl [autodiff]
+using Reactant, StructuredReactant, Test
+using StructuredReactant: FrontendError
 
 const compile_calls = Ref(0)
 
@@ -77,7 +77,7 @@ end
 function classify(result)
     result isa Test.Fail && return "mismatch"
     message = sprint(show, result)
-    m = match(r"ReactantIRFrontend: ([^\n]*)", message)
+    m = match(r"StructuredReactant: ([^\n]*)", message)
     m !== nothing && return "unsupported: " * m.captures[1]
     m = match(
         r"(?:Test threw exception|Got exception outside of a @test)\n\s*([^\n]*)", message

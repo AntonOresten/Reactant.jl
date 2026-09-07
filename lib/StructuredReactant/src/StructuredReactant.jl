@@ -1,12 +1,4 @@
-"""
-    ReactantIRFrontend
-
-Ordinary Julia control flow for Reactant, without `@trace`: the program is
-inferred on traced types, restructured into `if`/`while`/`for` regions with
-IRStructurizer, and interpreted; every call to a method Reactant owns is handed
-to Reactant unchanged. See [`structured`](@ref) and the package's [`@compile`](@ref).
-"""
-module ReactantIRFrontend
+module StructuredReactant
 
 using Reactant: Reactant, Ops, TracedRArray, TracedRNumber, TracedType
 using ReactantCore: ReactantCore, MissingTracedValue
@@ -30,16 +22,26 @@ using IRStructurizer:
 
 const CC = Core.Compiler
 
+include("errors.jl")
+public FrontendError
+
+include("interpreter.jl")
+
+include("code.jl")
+
+include("program.jl")
 export structured
 
-include("errors.jl")
-include("interpreter.jl")
-include("code.jl")
-include("program.jl")
 include("entrypoints.jl")
+public @compile, @jit, @code_hlo, compile, code_hlo
+
 include("emit.jl")
+
 include("intrinsics.jl")
+
 include("regions.jl")
+public UNROLL_WARNING
+
 include("precompile.jl")
 
 end

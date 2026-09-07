@@ -11,7 +11,7 @@ end
 FrontendError(message::AbstractString) = FrontendError(String(message), String[])
 
 function Base.showerror(io::IO, err::FrontendError)
-    print(io, "ReactantIRFrontend: ", err.message)
+    print(io, "StructuredReactant: ", err.message)
     for frame in err.context
         print(io, "\n  in ", frame)
     end
