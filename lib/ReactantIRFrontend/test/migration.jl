@@ -31,7 +31,7 @@ end
 for entry in (:compile, :code_hlo, :code_mhlo, :code_xla)
     @eval function Reactant.Compiler.$entry(ctx, f, args::Tuple; kwargs...)
         compile_calls[] += 1
-        return Base.invoke(
+        result = Base.invoke(
             Reactant.Compiler.$entry,
             Tuple{Any,Any,Any},
             ctx,
@@ -39,6 +39,9 @@ for entry in (:compile, :code_hlo, :code_mhlo, :code_xla)
             map(route, args);
             kwargs...,
         )
+        # A compiled function's signature holds the routed function-valued
+        # arguments, so calls made with the bare functions are routed the same way.
+        return $(entry === :compile) ? (a...) -> result(map(route, a)...) : result
     end
 end
 
