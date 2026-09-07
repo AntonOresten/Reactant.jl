@@ -1,8 +1,8 @@
 """
     FrontendError(message, [context])
 
-Raised when the frontend meets Julia it cannot express as a StableHLO program.
-`context` names the methods being emitted, innermost first.
+Julia the frontend cannot express as a StableHLO program. `context` names the
+methods being emitted, innermost first.
 """
 struct FrontendError <: Exception
     message::String

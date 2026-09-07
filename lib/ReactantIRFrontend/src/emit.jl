@@ -1,36 +1,21 @@
-# The emitter: an interpreter over structured IR.
-#
-# Values are ordinary Julia values, traced or not. A statement is evaluated by
-# resolving its operands and either running it (builtins, host-only calls),
-# handing it to Reactant (leaf methods, intrinsics on traced numbers), or
-# recursing into the callee's structured IR. Control-flow ops are emitted in
-# regions.jl through Reactant's region builders.
+# The emitter: an interpreter over structured IR. Control flow is in regions.jl.
 
-# `for i in a:b` with a traced endpoint iterates a `TracedUnitRange`, whose
-# `iterate` cannot decide termination on the host. The protocol is implemented
-# symbolically instead (regions.jl): the iterator state is this counter,
-# `iterate(r, state)` advances it, and the `=== nothing` test Julia lowers the
-# loop with becomes a traced comparison against the range's end.
+# The iterator state of a `TracedUnitRange`, whose `iterate` cannot decide
+# termination on the host; the `=== nothing` test becomes a traced comparison.
 struct Iteration{I,S}
     i::I
     stop::S
 end
 
-# A traced range captured by a region travels as its endpoints (Reactant's
-# tracer does not handle the range type) and is rebuilt on the other side.
+# A traced range crosses a region as its endpoints; Reactant's tracer does not
+# handle the range type.
 struct RangeCapture{S,T}
     start::S
     stop::T
     length::Int
 end
 
-"""
-    Frame
-
-Emission state of one method activation: the values bound to arguments, SSA
-values, and region block arguments. Regions fork the frame so that values
-re-traced by Reactant's builders shadow the originals only inside the region.
-"""
+# Emission state of one method activation; regions fork it.
 mutable struct Frame
     const code::Code
     const arguments::Vector{Any}   # Argument(n) => arguments[n]; arguments[1] is the callee
@@ -80,9 +65,8 @@ operand(fr::Frame, x::BlockArgument) = fr.blockargs[x.id]
 operand(fr::Frame, x::Core.PiNode) = operand(fr, x.val)
 operand(::Frame, x::QuoteNode) = x.value
 operand(::Frame, x::GlobalRef) = getglobal(x.mod, x.name)
-# An `undef` operand is never read on its path, so any value of its type
-# serves; a number is materialized so that a slot undefined in both branches
-# of a traced `if` does not need Reactant to fill it in.
+# An `undef` operand is never read on its path; a number is materialized so that
+# a slot undefined in both branches of a traced `if` needs no filling.
 function operand(::Frame, u::Undef)
     T = u.type
     T isa DataType && T <: Number && return zero(T)
@@ -113,12 +97,7 @@ end
 
 unsupported(::Frame, what) = throw(FrontendError(string(what, " is not supported")))
 
-"""
-    has_traced(x) -> Bool
-
-Whether `x` is or contains a traced value. Types, modules, and other
-metadata are leaves; containers and structs are searched.
-"""
+# Whether `x` is or contains a traced value.
 function has_traced(@nospecialize(x), seen::Base.IdSet{Any}=Base.IdSet{Any}())
     x isa TracedType && return true
     x isa Union{Type,Module,Symbol,AbstractString,Core.MethodInstance,Method} &&
@@ -162,14 +141,8 @@ struct Conditioned
     values::Tuple
 end
 
-"""
-    Continuation
-
-The rest of a block after an `if` that contains a `return`. StableHLO regions
-cannot return from the enclosing function, so the statements after such an `if`
-are emitted inside each branch that yields, and both branches then produce the
-function result. `next` continues the enclosing block when the `if` is nested.
-"""
+# The rest of a block after an `if` containing a `return`: regions cannot return
+# from the function, so the rest is emitted inside each branch that yields.
 struct Continuation
     block::Block
     position::Int
@@ -285,10 +258,8 @@ function emit_stmt(fr::Frame, ex::Expr)
     return unsupported(fr, "the `$(head)` expression")
 end
 
-# `:new` bypasses constructors because inference already checked the field
-# values. A value that became traced after inference (a loop carry or an
-# induction variable) no longer matches the type inference chose, so the object
-# is rebuilt through the type's constructor on the runtime values instead.
+# A field that became traced after inference no longer matches the type `:new`
+# was given, so the object is rebuilt through its constructor.
 function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
     T isa DataType || unsupported(fr, "constructing a value of type $(T)")
     if all(i -> fields[i] isa fieldtype(T, i), eachindex(fields))
@@ -322,13 +293,7 @@ function reparameterize(T::DataType, fields::Vector{Any})
     return T.name.wrapper{params...}
 end
 
-"""
-    emit_call(fr, f, args)
-
-Emit a call site. Builtins run in Julia; intrinsics run in Julia unless an
-operand is traced; a call whose arguments carry no traced values is ordinary
-Julia; everything else is dispatched with `emit_method`.
-"""
+# Builtins and calls without traced arguments run in Julia.
 function emit_call(fr::Frame, @nospecialize(f), args::Tuple)
     if f isa Core.IntrinsicFunction   # intrinsics are builtins too; test them first
         return emit_intrinsic(fr, f, args)
@@ -340,8 +305,7 @@ function emit_call(fr::Frame, @nospecialize(f), args::Tuple)
     return f(args...)
 end
 
-# Leaf calls reach here with a traced value among their arguments (see
-# `emit_call`), so counting them tells emitting loop iterations from host ones.
+# Counting leaf calls tells emitting loop iterations from host ones.
 const EMISSIONS = Ref(0)
 
 function leaf(@nospecialize(f), args::Tuple)
@@ -349,15 +313,8 @@ function leaf(@nospecialize(f), args::Tuple)
     return Reactant.call_with_reactant(f, map(structure_callback, args)...)
 end
 
-"""
-    emit_method(f, args, parent)
-
-Dispatch `f(args...)` on the runtime types of its arguments. A leaf method is
-called through `Reactant.call_with_reactant`, with any user function among its
-arguments wrapped in `structured` so that callbacks the leaf invokes (the body
-given to `Enzyme.autodiff`, the function mapped over an array) are captured
-too; any other method is emitted from its structured IR in a new frame.
-"""
+# Dispatch on the runtime argument types: a leaf is called through Reactant with
+# user callbacks among its arguments wrapped; any other method is emitted.
 function emit_method(@nospecialize(f), args::Tuple, parent::Union{Nothing,Frame})
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
@@ -385,8 +342,7 @@ function emit_method(@nospecialize(f), args::Tuple, parent::Union{Nothing,Frame}
     return outcome.value
 end
 
-# Base, Reactant, and Enzyme functions are left as they are: leaves compare
-# them by identity (`op === Base.add_sum`).
+# Leaves compare Base functions by identity (`op === Base.add_sum`).
 function structure_callback(@nospecialize(x))
     x isa Function || return x
     x isa Program && return x
@@ -419,11 +375,8 @@ function emit_builtin(fr::Frame, @nospecialize(f), args::Tuple)
     return f(args...)
 end
 
-# `===` on numbers is identity within a type. Structurization synthesizes it for
-# integer branch discriminators, which become traced through a traced `if`; a
-# traced number stands in for its element type, so this is `==` for integers of
-# one type and `false` across types. Floating-point identity is bitwise and has
-# no operation here.
+# Structurization synthesizes `===` on integer discriminators, which turn traced
+# through a traced `if`: `==` within one integer type, `false` across types.
 function identical(fr::Frame, a::Number, b::Number)
     element(x) = x isa TracedRNumber ? Reactant.unwrapped_eltype(x) : typeof(x)
     element(a) === element(b) || return false

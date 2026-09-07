@@ -1,12 +1,4 @@
-# Structured IR per call signature, cached for the worlds it is valid in.
-
-"""
-    Code
-
-The structured IR of one method specialization, with what the emitter needs to
-run it: the method (for argument packing and diagnostics), its static
-parameters, and the worlds in which the inference result is valid.
-"""
+# The structured IR of one method specialization, cached per call signature.
 struct Code
     sci::StructuredIRCode
     method::Method
@@ -31,13 +23,8 @@ function worlds_intersection(a::CC.WorldRange, b::CC.WorldRange)
     return CC.WorldRange(max(a.min_world, b.min_world), min(a.max_world, b.max_world))
 end
 
-"""
-    resolve(sig, world) -> Union{Nothing, Resolution}
-
-Find the method that `sig` dispatches to in `world`: `nothing` when there is no
-method, a leaf resolution when Reactant owns it, and otherwise the method's
-structured IR. Results are cached until a method definition invalidates them.
-"""
+# What `sig` dispatches to in `world`: `nothing` without a method, a leaf, or
+# the method's structured IR; cached until a method definition invalidates it.
 function resolve(@nospecialize(sig::Type), world::UInt)
     return lock(RESOLUTIONS_LOCK) do
         cached = get(RESOLUTIONS, sig, nothing)
@@ -74,9 +61,8 @@ function resolve(@nospecialize(sig::Type), world::UInt)
     end
 end
 
-# The optimized IR of a specialization, with the worlds its inference is valid
-# in. Julia 1.12 records those on the `IRCode`; 1.11 only on the inference
-# frame, so there the optimizer is run by hand, as `typeinf_ircode` does.
+# Julia 1.12 records the valid worlds on the `IRCode`; 1.11 only on the frame,
+# so there the optimizer is run by hand, as `typeinf_ircode` does.
 @static if VERSION >= v"1.12-"
     function infer(interp::Interpreter, mi::Core.MethodInstance)
         ir, _ = CC.typeinf_ircode(interp, mi, nothing)
@@ -92,9 +78,8 @@ else
     end
 end
 
-# Infer with traced Bool arguments admitted as host Bools, for the same reason
-# leaf results are (see the interpreter). The concrete signature stays the
-# cache key; the widened one only shapes inference.
+# Traced Bool arguments are admitted as host Bools, as leaf results are; the
+# concrete signature stays the cache key.
 function specialization(interp::Interpreter, match::Core.MethodMatch, @nospecialize(sig))
     widened = Tuple{map(widen_traced_bool, sig.parameters)...}
     widened === sig && return CC.specialize_method(match)
@@ -109,10 +94,8 @@ function widen_traced_bool(@nospecialize(T))
     return T === TracedRNumber{Bool} ? Union{Bool,TracedRNumber{Bool}} : T
 end
 
-# Exception handlers are not traced: nothing throws in the compiled program, and
-# an exception raised while tracing aborts the compile. Only the normal path
-# survives, including the copy of a `finally` body on it, which is what
-# `@allowscalar` needs to restore the task's scalar-indexing state.
+# Handlers are dropped: nothing throws in the compiled program, and an exception
+# while tracing aborts the compile. The normal path keeps its `finally` copy.
 function strip_exception_handling!(ir::CC.IRCode)
     found = false
     for i in 1:length(ir.stmts)
@@ -130,11 +113,9 @@ function strip_exception_handling!(ir::CC.IRCode)
     return fold_trivial_phis!(decide_literal_branches!(CC.compact!(ir, true)))
 end
 
-# Julia 1.11 lowers `finally` to one shared body that then dispatches on a
-# state value. With the handler gone the state is a constant, and the branch
-# that would rethrow compares two literals. Deciding it here removes that dead
-# throwing exit before structurization, which would otherwise carry it out of
-# an enclosing loop.
+# Julia 1.11 lowers `finally` to one body dispatching on a state value; with the
+# handler gone the rethrow branch compares two literals, and left undecided it
+# would become a throwing exit carried out of an enclosing loop.
 function decide_literal_branches!(ir::CC.IRCode)
     decided = false
     for (b, block) in enumerate(ir.cfg.blocks)
@@ -172,11 +153,9 @@ function literal(@nospecialize(x))
     return Ref{Any}(x)
 end
 
-# Compaction folds a phi with one edge into its value, and may leave a loop
-# phi that merges a value only with itself: Julia 1.11 saves every variable a
-# `try` body reads in a slot, so an array only mutated in a loop becomes such a
-# phi once the catch edge is gone, and would then be a loop carry that rolls the
-# loop from its first iteration. Rename the uses of such phis to their value.
+# Julia 1.11 saves every variable a `try` reads in a slot, which leaves loop phis
+# merging a value with itself once the catch edge is gone; such a phi would be a
+# loop carry that rolls the loop from its first iteration.
 function fold_trivial_phis!(ir::CC.IRCode)
     rename = Dict{Int,Any}()
     function target(@nospecialize(v))
@@ -186,8 +165,7 @@ function fold_trivial_phis!(ir::CC.IRCode)
         end
         return v
     end
-    # A phi becomes trivial once the phis it merges with are folded (the header
-    # of a loop merging an inner loop's exit), so iterate to a fixed point.
+    # A phi turns trivial once the phis it merges with fold: fixed point.
     changed = true
     while changed
         changed = false
@@ -215,18 +193,14 @@ function fold_trivial_phis!(ir::CC.IRCode)
     return ir
 end
 
-# Writing a statement goes through the compiler's own `setindex!`: on Julia
-# 1.11 it is not `Base.setindex!`, which has no method for an `Instruction`.
+# On Julia 1.11 `Base.setindex!` has no method for an `Instruction`.
 function setstmt!(ir::CC.IRCode, i::Int, @nospecialize(stmt))
     return CC.setindex!(ir.stmts[i], stmt, :stmt)
 end
 
-# Reading a field of an immutable value is pure, so a read dominated by an
-# identical earlier read can reuse it. Julia does not do this itself, and the
-# inlined `iterate` over a range that came from a leaf call (`eachindex(x)`,
-# `axes(x, 1)`) re-reads `stop` inside the loop; IRStructurizer releases up to
-# 0.6.4 then take that body-defined value as the loop bound and produce invalid
-# IR. Later releases hoist such reads themselves (maleadt/IRStructurizer.jl#62).
+# The inlined `iterate` over a range from a leaf call re-reads `stop` inside the
+# loop; IRStructurizer up to 0.6.4 then takes that body-defined value as the
+# bound. Later releases hoist such reads (maleadt/IRStructurizer.jl#62).
 const STRUCTURIZER_HOISTS = pkgversion(IRStructurizer) > v"0.6.4"
 
 function dedup_getfield!(ir::CC.IRCode)

@@ -1,17 +1,10 @@
 """
     ReactantIRFrontend
 
-Capture ordinary Julia control flow for Reactant from inferred, structured IR.
-
-Reactant discovers a program by executing it with traced values, so a branch or
-loop on a traced value has to be annotated with `@trace`. This package infers the
-program on traced types instead, restructures the SSA IR into `if`/`while`/`for`
-regions with IRStructurizer, and walks that IR. Every call to a method Reactant
-owns is handed to Reactant unchanged; only the control flow between those calls
-is emitted here, through Reactant's own region builders.
-
-See [`structured`](@ref), and the package's [`@compile`](@ref) for using it as the
-default frontend.
+Ordinary Julia control flow for Reactant, without `@trace`: the program is
+inferred on traced types, restructured into `if`/`while`/`for` regions with
+IRStructurizer, and interpreted; every call to a method Reactant owns is handed
+to Reactant unchanged. See [`structured`](@ref) and the package's [`@compile`](@ref).
 """
 module ReactantIRFrontend
 

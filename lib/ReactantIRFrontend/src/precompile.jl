@@ -1,8 +1,5 @@
-# The first `resolve` of a session JIT-compiles the parts of `Core.Compiler`
-# and IRStructurizer that the interpreter reaches, which takes over ten seconds
-# regardless of the function. Resolving representative programs here puts that
-# code in the package image; emitting them also covers the emitter and, as in
-# Reactant's own workload, Reactant's tracing of the leaves involved.
+# The first `resolve` of a session JIT-compiles the compiler and IRStructurizer
+# code the interpreter reaches (over ten seconds); put it in the package image.
 using PrecompileTools: @setup_workload, @compile_workload
 
 @setup_workload begin

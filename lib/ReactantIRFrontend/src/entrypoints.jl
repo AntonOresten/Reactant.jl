@@ -1,17 +1,11 @@
-# Reactant's entry points, with the callee wrapped in `structured`.
-
 """
     @compile [option = value]... f(args...)
     @jit [option = value]... f(args...)
     @code_hlo [option = value]... f(args...)
 
-Reactant's macros of the same names applied to `structured(f)`. Options, keyword
-arguments and the broadcast form `f.(args...)` keep Reactant's meaning. They are
-not exported, so that `using Reactant` stays unambiguous; import them explicitly
-to make the frontend the default:
-
-    using Reactant
-    using ReactantIRFrontend: @compile, @jit, @code_hlo
+Reactant's macros of the same names applied to `structured(f)`; options and the
+broadcast form keep Reactant's meaning. Not exported: import them explicitly to
+make the frontend the default.
 """
 macro compile(args...)
     return forward(Symbol("@compile"), __source__, args)
@@ -45,9 +39,8 @@ end
     compile(f, args::Tuple; kwargs...)
     code_hlo(f, args::Tuple; kwargs...)
 
-The functions behind [`@compile`](@ref) and [`@code_hlo`](@ref): compile
-`structured(f)` for `args`, or return its MLIR module as text. Keyword arguments
-are Reactant's compile options, and `fn_kwargs` the keyword arguments of `f`.
+The functions behind [`@compile`](@ref) and [`@code_hlo`](@ref); keyword
+arguments are Reactant's compile options.
 """
 function compile(f, args::Tuple; kwargs...)
     return Reactant.Compiler.compile(structured(f), args; kwargs...)
