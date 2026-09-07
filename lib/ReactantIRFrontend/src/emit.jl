@@ -340,6 +340,15 @@ function emit_call(fr::Frame, @nospecialize(f), args::Tuple)
     return f(args...)
 end
 
+# Leaf calls reach here with a traced value among their arguments (see
+# `emit_call`), so counting them tells emitting loop iterations from host ones.
+const EMISSIONS = Ref(0)
+
+function leaf(@nospecialize(f), args::Tuple)
+    EMISSIONS[] += 1
+    return Reactant.call_with_reactant(f, map(structure_callback, args)...)
+end
+
 """
     emit_method(f, args, parent)
 
@@ -351,14 +360,12 @@ too; any other method is emitted from its structured IR in a new frame.
 """
 function emit_method(@nospecialize(f), args::Tuple, parent::Union{Nothing,Frame})
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
-    Reactant.should_rewrite_call(Core.Typeof(f)) ||
-        return Reactant.call_with_reactant(f, map(structure_callback, args)...)
+    Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
     sig = Tuple{Core.Typeof(f),map(Core.Typeof, args)...}
     resolution = resolve(sig, Base.get_world_counter())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
     code = resolution.code
-    code === nothing &&
-        return Reactant.call_with_reactant(f, map(structure_callback, args)...)
+    code === nothing && return leaf(f, args)
 
     fr = Frame(code, f, args, parent)
     ancestor = parent

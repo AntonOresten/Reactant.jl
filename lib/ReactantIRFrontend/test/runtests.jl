@@ -352,6 +352,26 @@ const y = Float32[-1, -2]
             @test_skip agrees(double_until, (x,))
         end
 
+        # Host iterations that emit operations are counted; past the threshold
+        # the loop is reported once, with the `@trace` hint that rolls it.
+        function stamp_all!(x)
+            for i in 1:4
+                @allowscalar x[i] = x[i] * 2.0f0
+            end
+            return x
+        end
+        threshold = ReactantIRFrontend.UNROLL_WARNING[]
+        ReactantIRFrontend.UNROLL_WARNING[] = 2
+        try
+            @test_logs (:warn, r"unrolled") match_mode = :any Reactant.@compile structured(
+                stamp_all!
+            )(
+                R(Float32[1, 2, 3, 4])
+            )
+        finally
+            ReactantIRFrontend.UNROLL_WARNING[] = threshold
+        end
+
         function loop_with_branch(x)
             while sum(x) > 1.0f0
                 if sum(x) > 8.0f0
