@@ -1,15 +1,7 @@
-# Control flow through Reactant's region builders.
-#
-# `Ops.if_condition` and `Ops.while_loop` build their regions by calling back
-# into Julia with re-traced copies of the values the region needs. A region
-# callback here forks the enclosing frame, binds those copies over the
-# originals, and emits the region's block. Everything Reactant does with the
-# results (zero-filling missing values, tracking mutated arguments, typing the
-# yields) is reused unchanged.
+# Control flow through Reactant's region builders: a region callback forks the
+# enclosing frame, binds the re-traced captures over the originals, and emits.
 
-# Values a region reads from its surroundings: operands used inside it that it
-# does not define. A continuation adds the rest of the enclosing blocks, which
-# are emitted inside the region too.
+# Values a region reads but does not define, the continuation included.
 function captures(op::ControlFlowOp, extra::Vector{Any}, k::Union{Nothing,Continuation})
     defined = Set{Any}()
     used = copy(extra)
@@ -81,8 +73,7 @@ collect_uses!(used, p::Core.PiNode) = push!(used, p.val)
 collect_uses!(used, ::Nothing) = used
 collect_uses!(used, @nospecialize(x)) = push!(used, x)
 
-# Only traced values go through the builders. Host values are read from the
-# forked frame, exactly as Julia would read them from the enclosing scope.
+# Only traced values go through the builders; host values are read from the fork.
 function traced_captures(fr::Frame, keys::Vector{Any})
     traced = Any[]
     values = Any[]
@@ -97,9 +88,7 @@ function traced_captures(fr::Frame, keys::Vector{Any})
     return traced, Tuple(values)
 end
 
-#-----------------------------------------------------------------------------
 # if
-#-----------------------------------------------------------------------------
 
 struct Region
     frame::Frame
@@ -130,11 +119,8 @@ function Reactant.call_with_reactant(r::Region, values...)
     return fill_dead_slots(result, r.other[], r.result_type)
 end
 
-# Structurization multiplexes several exit paths through one `if`, forwarding
-# `undef` in the slots a path does not define. A slot undefined in one branch
-# is filled by Reactant from the other branch's value; a slot undefined in both
-# is dead on this path but Reactant cannot type it, so the second branch
-# yields another slot of the same static type in its place.
+# A multiplexed exit leaves `undef` in slots a path does not define; one Reactant
+# cannot type (undefined in both branches) is replaced by a slot of the same type.
 function fill_dead_slots(values::Tuple, other::Tuple, @nospecialize(T))
     T isa DataType && T <: Tuple && length(T.parameters) == length(values) || return values
     missing(k) = values[k] isa MissingTracedValue && other[k] isa MissingTracedValue
@@ -173,8 +159,7 @@ function emit_if(fr::Frame, op::IfOp, k::Union{Nothing,Continuation})
         condition, then_region, else_region, values...; track_numbers=Number
     )
     k === nothing && return Yielded(Tuple(result))
-    # With a continuation both branches produced the enclosing block's outcome:
-    # the function result, or, in a general loop body, (done, values...).
+    # With a continuation both branches produced the enclosing block's outcome.
     return fr.exits ? Yielded(Tuple(result)) : Returned(only(result))
 end
 
@@ -182,18 +167,10 @@ function throws(block::Block)
     return block.terminator isa Core.ReturnNode && !isdefined(block.terminator, :val)
 end
 
-#-----------------------------------------------------------------------------
 # while and for
-#-----------------------------------------------------------------------------
 
-# Reactant's loop builder communicates through mutation: the body callback
-# writes the next iteration's values into the carries it received, and the
-# builder writes the loop results into the carries it was given. Carries are
-# therefore fresh traced copies, so SSA values before the loop stay intact.
-#
-# The builder only accepts singleton callbacks (it wraps anything with fields
-# in `apply` and re-traces it), so the state a callback needs is dynamically
-# scoped over the builder call instead of stored in the callback.
+# The loop builder communicates through mutation of the carries, so they are
+# fresh copies; it accepts only singleton callbacks, so their state is scoped.
 struct Loop
     frame::Frame
     op::Union{WhileOp,ForOp,LoopOp}
@@ -202,8 +179,7 @@ struct Loop
     counted::Int # position among the carries of a general loop's range iterator, or 0
 end
 
-# Key of a counted loop's iteration count among its invariants: it is not
-# bound in the frame, the condition reads it off the region.
+# Key of an invariant the condition reads off the region, not bound in the frame.
 struct Bound end
 bind!(::Frame, ::Bound, @nospecialize(_)) = nothing
 
@@ -212,13 +188,9 @@ const CURRENT_LOOP = Base.ScopedValues.ScopedValue{Union{Nothing,Loop}}(nothing)
 struct LoopCondition end
 struct LoopBody end
 
-# A loop runs here, at emission, for as long as its condition and the values it
-# carries are host values, exactly as it would in Julia; its body may still emit
-# operations on traced invariants. From the first iteration at which the
-# condition or a carried value is traced, the remainder becomes a
-# `stablehlo.while`. This also covers a carry without an initial value (Julia
-# dropped a dead initializer such as `v = similar(x)` before a loop that always
-# assigns `v`): the first host iteration supplies it.
+# A loop runs at emission while its condition and carries are host values; from
+# the first traced one on, the remainder is a `stablehlo.while`. The first host
+# iteration also supplies a carry whose dead initializer Julia dropped.
 function emit_loop(fr::Frame, op::ForOp)
     has_return(op) && unsupported(fr, "`return` inside a loop")
     carries = operands(fr, op.init_values)
@@ -239,17 +211,13 @@ function emit_loop(fr::Frame, op::ForOp)
     return roll_for(fr, op, lower, upper, step, map(v -> carry(fr, v), carries))
 end
 
-# A counted loop is rolled as `@trace for` emits it: a zero-based counter
-# compared in the condition against the iteration count, both carried, and the
-# induction variable computed from the counter in the body. Enzyme's reverse
-# pass recognizes that counter and indexes its caches by it.
+# Rolled as `@trace for` emits it: a zero-based counter compared against the
+# iteration count, which Enzyme's reverse pass recognizes and indexes caches by.
 function roll_for(fr::Frame, op::ForOp, lower, upper, step, carries::Tuple)
     T = lower isa Number ? typeof(lower) : Reactant.unwrapped_eltype(lower)
     count = traced(÷)(traced(-)(traced(+)(upper, step), lower + one(T)), step)
     keys, invariants = traced_captures(fr, captures(op, Any[op.step], nothing))
-    # The first value of the induction variable (past any host iterations) and
-    # the iteration count, as invariants: the induction variable is rebuilt from
-    # them and the counter in the body.
+    # First induction value and iteration count, as invariants.
     push!(keys, Bound(), Bound())
     invariants = (invariants..., carry(fr, lower), carry(fr, count))
     carries = (Ops.constant(zero(T)), carries...)
@@ -281,8 +249,7 @@ end
 
 unassigned(carries::Tuple) = any(v -> v isa MissingTracedValue, carries)
 
-# Every host iteration of a loop that emits operations adds them to the
-# program. Past this many such iterations, say once how to roll the loop.
+# Past this many emitting host iterations, say once how to roll the loop.
 const UNROLL_WARNING = Ref(256)
 
 mutable struct Unrolled
@@ -312,11 +279,8 @@ function iteration(fr::Frame, body::Block, carries::Tuple)
     return outcome.values
 end
 
-# A general loop exits only through `break`, so its body runs at least once; the
-# first iteration also supplies carries without initial values. Iterations stay
-# on the host while the exit decision and the carried values are host values;
-# from the first traced decision on, the remainder is a `stablehlo.while` whose
-# first carry is the `done` flag.
+# A general loop exits only through `break`, so its body runs at least once; once
+# rolled, its first carry is the `done` flag.
 function emit_loop(fr::Frame, op::LoopOp)
     carries = operands(fr, op.init_values)
     k = counted_range(op)
@@ -342,8 +306,7 @@ function iteration_of_general_loop(fr::Frame, body::Block, carries::Tuple)
     return outcome.values
 end
 
-# Build the `stablehlo.while` for the remaining iterations. For a `for` loop the
-# first carry is the induction variable.
+# The `stablehlo.while` for the remaining iterations.
 function roll(fr::Frame, op::Union{WhileOp,LoopOp}, carries::Tuple)
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, 0, 0) begin
@@ -367,13 +330,11 @@ function Reactant.call_with_reactant(::LoopBody, carries, invariants)
 end
 
 function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
-    # A counted loop's condition is nothing but the compare of its zero-based
-    # counter against the carried iteration count; no capture is bound here.
+    # A counted loop's condition: counter against iteration count.
     role === :condition &&
         loop.bound != 0 &&
         return traced(<)(carries[1], invariants[loop.bound])
-    # A loop rolled inside a general loop's body must not inherit that body's
-    # `exits`: its own `continue` yields carries, not a `done` flag.
+    # Not the enclosing body's `exits`: this loop's `continue` yields carries.
     fr = fork(loop.frame; exits=false)
     bind!(fr, loop.keys, invariants)
     op = loop.op
@@ -446,18 +407,11 @@ function update!(fr::Frame, c::TracedType, @nospecialize(next))
     return nothing
 end
 
-#-----------------------------------------------------------------------------
 # counted loops over traced ranges
-#-----------------------------------------------------------------------------
 
-# A `for` over a range with traced endpoints reaches the emitter as a general
-# loop ending in Julia's iterate protocol: `next = iterate(r, state)`, then
-# `next === nothing` deciding between `continue` and `break`. As a general loop
-# it would carry a `done` flag computed in the body, which hides the induction
-# variable from Enzyme's reverse pass and duplicates the body once ahead of
-# the loop. Emitted as a counted loop instead, the carried `Iteration` is
-# compared against its bound in the condition, as `@trace for` does, and the
-# body runs up to the exit test. Any other exit keeps the general form.
+# A `for` over a traced range arrives as a general loop ending in the iterate
+# protocol; as such it would carry a body-computed `done` flag, which hides the
+# induction variable from Enzyme. Recognize the shape and roll it as counted.
 function counted_range(op::LoopOp)
     has_return(op) && return 0
     stmts = op.body.body.stmts
@@ -506,8 +460,7 @@ end
 is_nothing(@nospecialize(x)) = x === nothing || resolves(x, nothing)
 
 function roll_counted(fr::Frame, op::LoopOp, k::Int, carries::Tuple)
-    # The body runs at least once: its first run supplies carries without an
-    # initial value and yields the state of the second iteration.
+    # The first run supplies unassigned carries and the second iteration's state.
     carries = continued(fr, op, carries)
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
@@ -516,7 +469,7 @@ function roll_counted(fr::Frame, op::LoopOp, k::Int, carries::Tuple)
     T = unwrapped(it.i)
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
     push!(keys, Bound())
-    # The iterations left after the first: a zero-based counter runs to this.
+    # Iterations left after the first.
     invariants = (invariants..., traced(+)(traced(-)(it.stop, it.i), one(T)))
     carries = (Ops.constant(zero(T)), carries...)
     scope = Loop(fr, op, keys, length(invariants), k + 1)
@@ -543,9 +496,7 @@ function continued(fr::Frame, op::LoopOp, carries::Tuple)
     return operands(fr, last(body.stmts).then_region.terminator.values)
 end
 
-#-----------------------------------------------------------------------------
 # iterating a traced range
-#-----------------------------------------------------------------------------
 
 function iterates_traced_range(args::Tuple)
     length(args) in (1, 2) || return false
@@ -570,8 +521,7 @@ function iteration_done(fr::Frame, a, b)
     return traced(>)(it.i, it.stop)
 end
 
-# Reactant's builders trace the values a region receives; the counter and the
-# captured range are traced field by field like any immutable struct.
+# Region values are traced field by field, like any immutable struct.
 function Reactant.make_tracer(seen, it::Iteration, @nospecialize(path), mode; kwargs...)
     subpath(k) = mode == Reactant.TracedToTypes ? path : Reactant.append_path(path, k)
     i = Reactant.make_tracer(seen, it.i, subpath(1), mode; kwargs...)

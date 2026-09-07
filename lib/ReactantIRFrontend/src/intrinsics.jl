@@ -1,9 +1,5 @@
-# Julia intrinsics on traced numbers.
-#
-# Reactant's methods on `TracedRNumber` are the leaves, so intrinsics only reach
-# the emitter on host numbers, where they run natively, or on values that became
-# traced after inference: loop carries and values yielded by traced branches.
-# Those are mapped to the `Base` function Julia's own method would compute.
+# Intrinsics reach the emitter on traced operands only through values that became
+# traced after inference (loop carries, traced branches); map them to `Base`.
 
 function emit_intrinsic(fr::Frame, f::Core.IntrinsicFunction, args::Tuple)
     any(a -> a isa TracedRNumber, args) || return f(args...)

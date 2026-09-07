@@ -1,14 +1,6 @@
-# Inference on traced types.
-#
-# The interpreter is a plain `NativeInterpreter` with three differences:
-#   * it sees Reactant's overlay method table, so the program is typed exactly as
-#     Reactant would execute it;
-#   * `within_compile()` is a constant `true`, as in Reactant's own interpreter,
-#     so code that still uses `@trace` keeps taking its traced path;
-#   * leaf calls (Reactant's own methods, and Base or standard-library methods
-#     applied to Reactant types) are neither inferred here nor inlined. A leaf
-#     call is typed by Reactant's own interpreter, which infers those bodies
-#     anyway when the leaf is emitted.
+# Inference on traced types: a native interpreter over Reactant's overlay table,
+# with `within_compile()` constant `true` and leaf calls (Reactant's own methods,
+# Base applied to Reactant types) typed by Reactant's interpreter, not inlined.
 
 struct CacheOwner end
 
@@ -41,16 +33,7 @@ CC.lock_mi_inference(::Interpreter, ::Core.MethodInstance) = nothing
 CC.unlock_mi_inference(::Interpreter, ::Core.MethodInstance) = nothing
 CC.may_discard_trees(::Interpreter) = false
 
-"""
-    isleaf(method, sig) -> Bool
-
-Whether the call `sig` to `method` is an emission leaf. The emitter never walks
-a leaf's IR; it calls it through `Reactant.call_with_reactant`, as Reactant's
-frontend does at every call site. Leaves are Reactant's own methods and the
-methods in its overlay table, and, when the call involves Reactant types,
-methods of Base and the standard library: those run exactly as they do under
-Reactant today, and what happens inside them is Reactant's business.
-"""
+# A leaf is called through `Reactant.call_with_reactant`, never emitted from IR.
 function isleaf(method::Method, @nospecialize(sig))
     if isdefined(method, :external_mt)
         method.external_mt === Reactant.REACTANT_METHOD_TABLE && return true
@@ -81,10 +64,8 @@ function involves_reactant(@nospecialize(T))
     return false
 end
 
-# Host helpers such as `task_local_storage` bottom out in foreign calls, which
-# the emitter cannot interpret but can run natively as an out-of-line call. Keep
-# them, and anything with an exception handler, out of line. Sources must stay
-# uncompressed for the policy to see them.
+# Foreign calls and exception handlers stay out of line, where they run natively;
+# sources must stay uncompressed for the policy to see them.
 CC.may_compress(::Interpreter) = false
 
 function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
@@ -149,9 +130,7 @@ else
     union_split(info::CC.UnionSplitInfo) = info.matches
 end
 
-# Type a leaf call with Reactant's interpreter and stop there. Descending into
-# MLIR builders and Enzyme from this interpreter is wasted work and, for deep
-# call chains, overflows the stack during inference.
+# Type a leaf with Reactant's interpreter and stop there.
 function CC.abstract_call_method(
     interp::Interpreter,
     method::Method,
@@ -163,13 +142,9 @@ function CC.abstract_call_method(
 )
     if isleaf(method, sig)
         rt = leaf_return_type(sig, interp.world)
-        # Reactant's interpreter sees a callback that branches on a traced Bool
-        # as always throwing; here the callback is structured, so the leaf may
-        # well return.
+        # A structured callback returns where Reactant's sees it always throw.
         rt === Union{} && (rt = Any)
-        # A traced Bool in boolean context branches symbolically instead of
-        # throwing. Julia would prove such a branch dead; admitting a host
-        # Bool keeps it, and dispatch on the traced value is unaffected.
+        # Admitting a host Bool keeps branches on traced Bools alive.
         if TracedRNumber{Bool} in Base.uniontypes(rt)
             rt = Union{rt,Bool}
         end

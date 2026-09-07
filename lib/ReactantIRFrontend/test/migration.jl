@@ -1,22 +1,13 @@
-# Migration experiment: how much of one of Reactant's own test files passes
-# when `@trace` on control flow is an identity macro (its options and call
-# outlining stay) and every compilation goes through `structured`? Not part of the test suite. Run in its own process, naming the
-# file under `test/core` (`control_flow` by default, `autodiff` is the other
-# one that exercises control flow):
-#
+# How much of one of Reactant's own test files (`control_flow` by default, or
+# `autodiff`) passes with `@trace` on control flow made an identity macro and
+# every compilation routed through `structured`? Not part of the test suite:
 #     julia --project=lib/ReactantIRFrontend/test lib/ReactantIRFrontend/test/migration.jl [autodiff]
-#
-# The upstream file and its assertions are included unchanged. Failures are
-# classified as unsupported (a `FrontendError`), mismatch (an assertion that
-# compiled but disagreed), or other.
 using Reactant, ReactantIRFrontend, Test
 using ReactantIRFrontend: FrontendError
 
 const compile_calls = Ref(0)
 
-# Functions given to Reactant are routed through the frontend, including
-# callbacks such as the function differentiated by `Enzyme.gradient`. Base and
-# Reactant functions passed as arguments are left alone.
+# Route user functions, callbacks included; leave Base and Reactant ones alone.
 function route(f)
     f isa Base.Broadcast.BroadcastFunction &&
         return Base.Broadcast.BroadcastFunction(route(f.f))
@@ -45,10 +36,8 @@ for entry in (:compile, :code_hlo, :code_mhlo, :code_xla)
     end
 end
 
-# A bare `@trace` on `if`, `for` or `while` is the annotation the frontend makes
-# unnecessary and becomes an identity. Everything else `@trace` does is kept:
-# options (`checkpointing`, `mincut`, `track_numbers`) are the hints it remains
-# the carrier of, and `@trace f(x)` or `@trace function ...` outline calls.
+# A bare `@trace` on control flow becomes an identity; its options and the call
+# outlining forms are hints the frontend does not replace, and are kept.
 const TRACE_WORLD = Base.get_world_counter()   # the original macro lives here
 @eval Reactant.ReactantCore macro trace(args...)
     if length(args) == 1 && Meta.isexpr(only(args), (:if, :for, :while))

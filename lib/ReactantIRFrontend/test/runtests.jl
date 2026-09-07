@@ -624,7 +624,6 @@ const y = Float32[-1, -2]
         @test matches(Core.eval(m, :(@jit pick($(R(-x))))), -(-x))
     end
 
-    # Cases kept from the review of the prototype in `experimental/IRFrontend`.
     @testset "regressions" begin
         x = Float32[1, -2, 3]
 
@@ -652,10 +651,8 @@ const y = Float32[-1, -2]
         end
         @test err isa FrontendError && occursin("shape", err.message)
 
-        # Unsigned comparisons on a counter that is traced once its loop rolls: a
-        # signed one is rejected rather than silently compared as signed, whether
-        # it was a constant or an input; an unsigned one is compared as unsigned.
-        # (`i` must not be assigned elsewhere in this block, or Julia would box it.)
+        # An unsigned comparison on a signed traced counter is rejected, not
+        # silently signed. (`i` must not be assigned elsewhere: Julia would box it.)
         function unsigned_host(x)
             i = -2
             while i < 0
@@ -697,10 +694,8 @@ const y = Float32[-1, -2]
         ir = unoptimized(overlaid, x)
         @test occursin("stablehlo.multiply", ir) && !occursin("stablehlo.add", ir)
 
-        # A short-circuit right-hand side is emitted inside the region its guard
-        # opens, not ahead of it: in `main`, the division (a batched scalar helper
-        # in unoptimized IR) sits deeper than the `if` and before the first line
-        # back at the `if`'s depth.
+        # A short-circuit right-hand side is emitted inside its guard's region:
+        # the division sits deeper than the `if` in `main`.
         guarded(x) = (s=sum(x); s > 0.0f0 && sum(x ./ s) > 0.5f0) ? x : -x
         @test agrees(guarded, (x,), (-x,), (Float32[0.1, 0.1, 0.1],))
         lines = split(unoptimized(guarded, x), '\n')
