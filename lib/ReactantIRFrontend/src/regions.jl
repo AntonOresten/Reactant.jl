@@ -198,11 +198,12 @@ struct Loop
     frame::Frame
     op::Union{WhileOp,ForOp,LoopOp}
     keys::Vector{Any}
-    bound::Int   # position among the invariants of a counted loop's carried bound, or 0
+    bound::Int   # position among the invariants of a counted loop's iteration count, or 0
+    counted::Int # position among the carries of a general loop's range iterator, or 0
 end
 
-# Key of a counted loop's bound among its invariants when the bound is a host
-# value: it is not bound in the frame, the condition reads it off the region.
+# Key of a counted loop's iteration count among its invariants: it is not
+# bound in the frame, the condition reads it off the region.
 struct Bound end
 bind!(::Frame, ::Bound, @nospecialize(_)) = nothing
 
@@ -235,7 +236,29 @@ function emit_loop(fr::Frame, op::ForOp)
     end
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
-    return roll(fr, op, (carry(fr, lower), map(v -> carry(fr, v), carries)...))
+    return roll_for(fr, op, lower, upper, step, map(v -> carry(fr, v), carries))
+end
+
+# A counted loop is rolled as `@trace for` emits it: a zero-based counter
+# compared in the condition against the iteration count, both carried, and the
+# induction variable computed from the counter in the body. Enzyme's reverse
+# pass recognizes that counter and indexes its caches by it.
+function roll_for(fr::Frame, op::ForOp, lower, upper, step, carries::Tuple)
+    T = lower isa Number ? typeof(lower) : Reactant.unwrapped_eltype(lower)
+    count = traced(÷)(traced(-)(traced(+)(upper, step), lower + one(T)), step)
+    keys, invariants = traced_captures(fr, captures(op, Any[op.step], nothing))
+    # The first value of the induction variable (past any host iterations) and
+    # the iteration count, as invariants: the induction variable is rebuilt from
+    # them and the counter in the body.
+    push!(keys, Bound(), Bound())
+    invariants = (invariants..., carry(fr, lower), carry(fr, count))
+    carries = (Ops.constant(zero(T)), carries...)
+    Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, length(invariants), 0) begin
+        Ops.while_loop(
+            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
+        )
+    end
+    return Base.tail(carries)
 end
 
 function emit_loop(fr::Frame, op::WhileOp)
@@ -296,6 +319,8 @@ end
 # first carry is the `done` flag.
 function emit_loop(fr::Frame, op::LoopOp)
     carries = operands(fr, op.init_values)
+    k = counted_range(op)
+    k != 0 && carries[k] isa Iteration && return roll_counted(fr, op, k, carries)
     unrolled = Unrolled(fr)
     local done
     while true
@@ -319,25 +344,14 @@ end
 
 # Build the `stablehlo.while` for the remaining iterations. For a `for` loop the
 # first carry is the induction variable.
-function roll(fr::Frame, op::Union{WhileOp,ForOp,LoopOp}, carries::Tuple)
-    extra = op isa ForOp ? Any[op.upper, op.step] : Any[]
-    keys, invariants = traced_captures(fr, captures(op, extra, nothing))
-    bound = 0
-    if op isa ForOp && operand(fr, op.upper) isa Number
-        # Enzyme recognizes the induction variable only if its limit is defined
-        # outside the loop; a host bound would be a constant inside the condition
-        # region. Carry it as an invariant, as `@trace for` does.
-        push!(keys, Bound())
-        invariants = (invariants..., Ops.constant(operand(fr, op.upper)))
-        bound = length(invariants)
-    end
-    Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, bound) begin
+function roll(fr::Frame, op::Union{WhileOp,LoopOp}, carries::Tuple)
+    keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
+    Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, 0, 0) begin
         Ops.while_loop(
             LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
         )
     end
 
-    op isa ForOp && return Base.tail(carries)   # drop the induction variable
     op isa LoopOp && return Base.tail(carries)  # drop the done flag
     # A while loop's results are the values its condition region forwards on exit.
     exit = fork(fr)
@@ -353,6 +367,11 @@ function Reactant.call_with_reactant(::LoopBody, carries, invariants)
 end
 
 function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
+    # A counted loop's condition is nothing but the compare of its zero-based
+    # counter against the carried iteration count; no capture is bound here.
+    role === :condition &&
+        loop.bound != 0 &&
+        return traced(<)(carries[1], invariants[loop.bound])
     # A loop rolled inside a general loop's body must not inherit that body's
     # `exits`: its own `continue` yields carries, not a `done` flag.
     fr = fork(loop.frame; exits=false)
@@ -370,18 +389,23 @@ function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
         bind!(fr, op.after.args, outcome.values)
         next = (emit_block(fr, op.after)::Yielded).values
         update!(fr, carries, next)
+    elseif op isa LoopOp && loop.counted != 0
+        counter, rest = carries[1], Base.tail(carries)
+        next = continued(fr, op, rest)
+        update!(fr, carries, (traced(+)(counter, one(unwrapped(counter))), next...))
     elseif op isa LoopOp
         done, rest = carries[1], Base.tail(carries)
         role === :condition && return traced(!)(done)
         update!(fr, carries, iteration_of_general_loop(fr, op.body, rest))
     else
-        iv, rest = carries[1], Base.tail(carries)
-        limit = loop.bound == 0 ? operand(fr, op.upper) : invariants[loop.bound]
-        role === :condition && return traced(<)(iv, limit)
-        bind!(fr, op.iv_arg, iv)
+        counter, rest = carries[1], Base.tail(carries)
+        T = unwrapped(counter)
+        lower, step = invariants[loop.bound - 1], operand(fr, op.step)
+        step isa Number && (step = T(step))
+        bind!(fr, op.iv_arg, traced(+)(lower, traced(*)(counter, step)))
         bind!(fr, op.body.args, rest)
         next = (emit_block(fr, op.body)::Yielded).values
-        update!(fr, carries, (traced(+)(iv, operand(fr, op.step)), next...))
+        update!(fr, carries, (traced(+)(counter, one(T)), next...))
     end
     return nothing
 end
@@ -420,6 +444,103 @@ function update!(fr::Frame, c::TracedType, @nospecialize(next))
         unsupported(fr, "a loop-carried value that changes type or shape")
     Reactant.TracedUtils.set_mlir_data!(c, next.mlir_data)
     return nothing
+end
+
+#-----------------------------------------------------------------------------
+# counted loops over traced ranges
+#-----------------------------------------------------------------------------
+
+# A `for` over a range with traced endpoints reaches the emitter as a general
+# loop ending in Julia's iterate protocol: `next = iterate(r, state)`, then
+# `next === nothing` deciding between `continue` and `break`. As a general loop
+# it would carry a `done` flag computed in the body, which hides the induction
+# variable from Enzyme's reverse pass and duplicates the body once ahead of
+# the loop. Emitted as a counted loop instead, the carried `Iteration` is
+# compared against its bound in the condition, as `@trace for` does, and the
+# body runs up to the exit test. Any other exit keeps the general form.
+function counted_range(op::LoopOp)
+    has_return(op) && return 0
+    stmts = op.body.body.stmts
+    isempty(stmts) && return 0
+    exit = last(stmts)
+    exit isa IfOp || return 0
+    then, otherwise = exit.then_region, exit.else_region
+    then.terminator isa ContinueOp && otherwise.terminator isa BreakOp || return 0
+    isempty(then.body.stmts) && isempty(otherwise.body.stmts) || return 0
+    any(s -> s isa IfOp && exits_loop(s), stmts[1:(end - 1)]) && return 0
+    next = iterate_of_exit(op.body, exit.condition)
+    next === nothing && return 0
+    k = findfirst(==(next), then.terminator.values)
+    return k === nothing ? 0 : k
+end
+
+# The `iterate` result behind an exit test `not_int(next === nothing)`.
+function iterate_of_exit(block::Block, condition)
+    stmt = defining(block, condition)
+    is_call(stmt, Base.not_int, 1) || return nothing
+    stmt = defining(block, stmt.args[2])
+    is_call(stmt, ===, 2) && is_nothing(stmt.args[3]) || return nothing
+    next = stmt.args[2]
+    stmt = defining(block, next)
+    stmt isa Expr && stmt.head in (:call, :invoke) || return nothing
+    resolves(stmt.args[stmt.head === :invoke ? 2 : 1], Base.iterate) || return nothing
+    return next
+end
+
+function defining(block::Block, @nospecialize(v))
+    v isa Core.SSAValue || return nothing
+    entry = get(block.body, v.id, nothing)
+    return entry === nothing ? nothing : entry.stmt
+end
+
+function is_call(@nospecialize(stmt), target, nargs::Int)
+    stmt isa Expr && stmt.head === :call && length(stmt.args) == nargs + 1 || return false
+    return resolves(stmt.args[1], target)
+end
+
+function resolves(@nospecialize(f), target)
+    f isa GlobalRef && (f = isdefined(f.mod, f.name) ? getglobal(f.mod, f.name) : missing)
+    return f === target
+end
+
+is_nothing(@nospecialize(x)) = x === nothing || resolves(x, nothing)
+
+function roll_counted(fr::Frame, op::LoopOp, k::Int, carries::Tuple)
+    # The body runs at least once: its first run supplies carries without an
+    # initial value and yields the state of the second iteration.
+    carries = continued(fr, op, carries)
+    unassigned(carries) &&
+        unsupported(fr, "reading a value after a loop that is only assigned inside it")
+    carries = map(v -> carry(fr, v), carries)
+    it = carries[k]::Iteration
+    T = unwrapped(it.i)
+    keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
+    push!(keys, Bound())
+    # The iterations left after the first: a zero-based counter runs to this.
+    invariants = (invariants..., traced(+)(traced(-)(it.stop, it.i), one(T)))
+    carries = (Ops.constant(zero(T)), carries...)
+    scope = Loop(fr, op, keys, length(invariants), k + 1)
+    Base.ScopedValues.@with CURRENT_LOOP => scope begin
+        Ops.while_loop(
+            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
+        )
+    end
+    return Base.tail(carries)
+end
+
+unwrapped(x) = Reactant.unwrapped_eltype(x)
+
+# One run of a counted loop's body up to its exit test; the continue values.
+function continued(fr::Frame, op::LoopOp, carries::Tuple)
+    fr = fork(fr; exits=false)
+    bind!(fr, op.body.args, carries)
+    body = op.body.body
+    for position in 1:(length(body.stmts) - 1)
+        idx = body.ssa_idxes[position]
+        fr.pc = idx
+        fr.ssa[idx] = emit_stmt(fr, body.stmts[position])
+    end
+    return operands(fr, last(body.stmts).then_region.terminator.values)
 end
 
 #-----------------------------------------------------------------------------
