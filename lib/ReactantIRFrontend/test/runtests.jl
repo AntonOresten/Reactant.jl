@@ -430,6 +430,36 @@ const y = Float32[-1, -2]
         @test host(compiled(R(y))) ≈ y .- Float32[10, 20]
     end
 
+    @testset "exception handlers are dropped" begin
+        # `@allowscalar` is a `try`/`finally`; only its normal path is traced, and
+        # that path still restores the task's scalar-indexing state.
+        function scalar_block(x)
+            if sum(x) > 0.0f0
+                @allowscalar x[1] = 1.0f0
+            end
+            return x
+        end
+        @test agrees(scalar_block, (Float32[1, -2, 3],), (Float32[-1, -2, -3],))
+        @test get(task_local_storage(), :ScalarIndexing, nothing) === nothing
+        function scalar_sum(x)
+            s = 0.0f0
+            for i in 1:2
+                s += @allowscalar x[i]
+            end
+            return s
+        end
+        @test agrees(scalar_sum, (x,))
+        # A handler that would only run on a trace-time exception is dropped.
+        function protected(x)
+            try
+                return sum(x) * 2.0f0
+            catch
+                return sum(x)
+            end
+        end
+        @test agrees(protected, (x,))
+    end
+
     @testset "leaves are Reactant's" begin
         # Straight-line code emits exactly what Reactant's frontend emits.
         fused(x) = sum(sin.(x) .+ abs.(x) ./ 2.0f0)
@@ -663,19 +693,6 @@ const y = Float32[-1, -2]
 
         checked(x) = sum(x) > 0.0f0 ? x : error("negative")
         @test_throws FrontendError Reactant.@compile structured(checked)(R(x))
-
-        function scalar_block(x)
-            if sum(x) > 0.0f0
-                @allowscalar x[1] = 1.0f0
-            end
-            return x
-        end
-        err = try
-            Reactant.@compile structured(scalar_block)(R(x))
-        catch e
-            e
-        end
-        @test err isa FrontendError && occursin("try", err.message)
 
         function traced_index(x)
             t = (1.0f0, 2.0f0)

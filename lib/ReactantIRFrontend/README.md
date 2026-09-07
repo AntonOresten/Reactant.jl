@@ -85,13 +85,15 @@ helpers at any depth including `@noinline` ones and dynamic dispatch, keyword
 and variadic arguments, closures, mutation inside branches, `@trace` inside
 structured code, elementwise control flow through `structured(f).(x)`, user
 callbacks handed to Reactant (`map`, `sum(f, x)`, the body given to
-`Enzyme.autodiff`), and Enzyme reverse mode.
+`Enzyme.autodiff`), Enzyme reverse mode, and `try` blocks such as
+`@allowscalar x[i]`: exception handlers are dropped, since nothing throws in
+the compiled program and an exception while tracing fails the compile, while
+a `finally` body still runs on the normal path.
 
 Rejected with a `FrontendError` naming the method: reading a value after a
 `while` loop that may not have assigned it,
 recursion on traced values, a branch on a traced condition that always throws,
-`===` on traced floating-point values, `try`/`catch` (so `@allowscalar x[i]`
-must be written `allowscalar(() -> x[i])`), and anything IRStructurizer cannot
+`===` on traced floating-point values, and anything IRStructurizer cannot
 structure. Releases up to 0.6.4 cannot structure a `for` nested directly in a
 `for` and mis-promote loops over opaque ranges such as `eachindex(x)`; both are
 fixed upstream (maleadt/IRStructurizer.jl#61 and #62), and until the next
