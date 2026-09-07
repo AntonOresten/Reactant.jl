@@ -504,6 +504,14 @@ const y = Float32[-1, -2]
         end
         loop_gradient(x) = Enzyme.gradient(Reverse, structured(loop_loss), x)[1]
         @test host(Reactant.@jit loop_gradient(R(x))) ≈ fill(0.125f0, 2)
+
+        # Second order once aborted the process: native inference of the entry
+        # point reached the emitter and typed `slope` on a traced number without
+        # Reactant's overlays, compiling its `gradient` under native Enzyme.
+        quartic(x) = x * x * x * x
+        slope(x) = Enzyme.gradient(Reverse, quartic, x)[1]
+        curvature(x) = Enzyme.gradient(Reverse, slope, x)[1]
+        @test host(Reactant.@jit structured(curvature)(R(3.1))) ≈ 12 * 3.1^2
     end
 
     @testset "entry points" begin

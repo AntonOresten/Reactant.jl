@@ -69,12 +69,18 @@ Base.show(io::IO, p::Program) = print(io, "structured(", p.f, ")")
 # regions from, through `call_with_reactant`. These methods are the frontend's
 # entry points: a `Program` is emitted from IR rather than executed. Code that
 # Reactant rewrote itself prefixes the call with the return type it inferred.
-Reactant.call_with_reactant(p::Program, args...) = emit_method(p.f, args, nothing)
+# Julia infers these methods natively, on the program's own types, and would
+# follow them into the emitter and type `f(args...)` there on traced values
+# without Reactant's overlays: a nested `Enzyme.gradient` then compiles under
+# native Enzyme and aborts. The barrier keeps that inference out of the emitter.
+function Reactant.call_with_reactant(p::Program, args...)
+    return Base.inferencebarrier(emit_method)(p.f, args, nothing)
+end
 
 function Reactant.call_with_reactant(
     ::typeof(Core.kwcall), kwargs::NamedTuple, p::Program, args...
 )
-    return emit_method(Core.kwcall, (kwargs, p.f, args...), nothing)
+    return Base.inferencebarrier(emit_method)(Core.kwcall, (kwargs, p.f, args...), nothing)
 end
 
 function Reactant.call_with_reactant(::Reactant.EnsureReturnType, p::Program, args...)
