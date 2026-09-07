@@ -710,6 +710,54 @@ const y = Float32[-1, -2]
             l -> !isempty(strip(l)) && indent(l) <= depth, lines, if_line + 1
         )
         @test indent(lines[div_line]) > depth && div_line < region_end
+
+        # Array wrappers captured by a rolled loop: the builders are not asked
+        # to promote numbers, so a wrapper's shape metadata stays as it is and
+        # Reactant rebuilds the wrapper around the re-traced parent. Reads,
+        # writes that must reach the parent, and a lazy adjoint as a carry.
+        function read_chunks(q)
+            q3 = reshape(q, 2, 4, 2)
+            acc = zeros(Float32, 2, 4)
+            for c in 1:2
+                acc = acc .+ q3[:, :, c]
+            end
+            return acc
+        end
+        grid = reshape(Float32.(1:16), 4, 4)
+        @test agrees(read_chunks, (grid,))
+        function write_through!(y, x)
+            y3 = reshape(y, 2, 4, 2)
+            s = sum(x)
+            for c in 1:3
+                y3 .= y3 .+ s
+                s = s + 1
+            end
+            return s
+        end
+        y = R(grid)
+        Reactant.@jit structured(write_through!)(y, R(x))
+        @test host(y) == grid .+ (3 * sum(x) + 3)
+        function adjoint_carry(k, v)
+            kt = k'
+            S = zeros(Float32, 2, 2)
+            for c in 1:2
+                S = S .+ v * kt
+            end
+            return S
+        end
+        @test agrees(adjoint_carry, (Float32[1 2; 3 4], Float32[1 0; 0 1]))
+
+        # `a:b` inlined to a `UnitRange` is rebuilt through Reactant's `:` once
+        # the counter it is built from is traced.
+        function range_from_counter(x)
+            total = sum(x)
+            for c in 1:3
+                r = (2c - 1):(2c)
+                total = total + last(r) - first(r)
+            end
+            return total
+        end
+        @test agrees(range_from_counter, (x,))
     end
 
     @testset "redefinition" begin
