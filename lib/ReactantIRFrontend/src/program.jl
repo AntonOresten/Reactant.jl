@@ -74,13 +74,32 @@ Base.show(io::IO, p::Program) = print(io, "structured(", p.f, ")")
 # without Reactant's overlays: a nested `Enzyme.gradient` then compiles under
 # native Enzyme and aborts. The barrier keeps that inference out of the emitter.
 function Reactant.call_with_reactant(p::Program, args...)
-    return Base.inferencebarrier(emit_method)(p.f, args, nothing)
+    return scalar_indexing_preserved() do
+        return Base.inferencebarrier(emit_method)(p.f, args, nothing)
+    end
 end
 
 function Reactant.call_with_reactant(
     ::typeof(Core.kwcall), kwargs::NamedTuple, p::Program, args...
 )
-    return Base.inferencebarrier(emit_method)(Core.kwcall, (kwargs, p.f, args...), nothing)
+    return scalar_indexing_preserved() do
+        return Base.inferencebarrier(emit_method)(
+            Core.kwcall, (kwargs, p.f, args...), nothing
+        )
+    end
+end
+
+# `@allowscalar` restores the task's scalar-indexing state in a `finally` body,
+# of which the emitter keeps only the normal path; an emission that fails
+# inside one would leave the state set. Restore it here instead.
+function scalar_indexing_preserved(f)
+    tls = task_local_storage()
+    saved = get(tls, :ScalarIndexing, nothing)
+    try
+        return f()
+    finally
+        saved === nothing ? delete!(tls, :ScalarIndexing) : (tls[:ScalarIndexing] = saved)
+    end
 end
 
 function Reactant.call_with_reactant(::Reactant.EnsureReturnType, p::Program, args...)

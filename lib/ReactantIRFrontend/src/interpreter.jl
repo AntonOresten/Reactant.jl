@@ -88,9 +88,29 @@ function CC.src_inlining_policy(
     stmt_flag::UInt32,
 )
     inlines_leaf(info) && return false
+    opaque_to_emitter(src) && return false
     return @invoke CC.src_inlining_policy(
         interp::CC.AbstractInterpreter, src::Any, info::CC.CallInfo, stmt_flag::UInt32
     )
+end
+
+# Host helpers such as `task_local_storage` bottom out in foreign calls, which
+# the emitter cannot interpret but can run natively as an out-of-line call. Keep
+# them, and anything with an exception handler, out of line. Sources must stay
+# uncompressed for the policy to see them.
+CC.may_compress(::Interpreter) = false
+
+function opaque_to_emitter(@nospecialize(src))
+    stmts = if src isa Core.CodeInfo
+        src.code
+    elseif src isa CC.IRCode
+        src.stmts.stmt
+    else
+        return false
+    end
+    return any(stmts) do stmt
+        return (stmt isa Expr && stmt.head === :foreigncall) || stmt isa Core.EnterNode
+    end
 end
 
 function inlines_leaf(info::CC.MethodMatchInfo)

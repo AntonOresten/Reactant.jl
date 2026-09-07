@@ -53,12 +53,7 @@ function resolve(@nospecialize(sig::Type), world::UInt)
             mi = specialization(interp, match, sig)
             ir, _ = CC.typeinf_ircode(interp, mi, nothing)
             ir === nothing && throw(FrontendError("inference of $(sig) failed"))
-            any(stmt -> stmt isa Core.EnterNode, ir.stmts.stmt) && throw(
-                FrontendError(
-                    "`try`/`catch` in $(match.method) is not supported " *
-                    "(`@allowscalar` expands to one; use `allowscalar(() -> ...)`)",
-                ),
-            )
+            ir = strip_exception_handling!(ir)
             STRUCTURIZER_HOISTS || dedup_getfield!(ir)
             sci = try
                 StructuredIRCode(ir)
@@ -94,6 +89,26 @@ end
 
 function widen_traced_bool(@nospecialize(T))
     return T === TracedRNumber{Bool} ? Union{Bool,TracedRNumber{Bool}} : T
+end
+
+# Exception handlers are not traced: nothing throws in the compiled program, and
+# an exception raised while tracing aborts the compile. Only the normal path
+# survives, including the copy of a `finally` body on it, which is what
+# `@allowscalar` needs to restore the task's scalar-indexing state.
+function strip_exception_handling!(ir::CC.IRCode)
+    found = false
+    for i in 1:length(ir.stmts)
+        stmt = ir.stmts[i][:stmt]
+        if stmt isa Core.EnterNode
+            found = true
+            CC.kill_edge!(ir, CC.block_for_inst(ir.cfg, i), stmt.catch_dest)
+            ir.stmts[i][:stmt] = nothing
+        elseif stmt isa Core.UpsilonNode ||
+            (stmt isa Expr && stmt.head in (:leave, :pop_exception))
+            ir.stmts[i][:stmt] = nothing
+        end
+    end
+    return found ? CC.compact!(ir, true) : ir
 end
 
 # Reading a field of an immutable value is pure, so a read dominated by an
