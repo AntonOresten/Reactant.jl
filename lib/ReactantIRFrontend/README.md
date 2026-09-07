@@ -68,7 +68,10 @@ time, as it would in Julia, for as long as its condition and carried values are
 host values (its body may still emit operations on traced values); from the
 first iteration at which the condition or a carried value is traced, the
 remainder becomes a `stablehlo.while`. A loop that exits through `break` or
-`return` carries a `done` flag.
+`return` carries a `done` flag. A loop that stays on the host while its body
+emits operations, such as a scalar-indexed kernel, is unrolled into the
+program; past `UNROLL_WARNING[]` such iterations (256) a warning says so once
+and points at `@trace for`, which rolls a loop regardless.
 
 Because loop carries and induction variables become traced only at emission,
 a traced number stands in for its element type: intrinsics on it map to the

@@ -218,10 +218,12 @@ function emit_loop(fr::Frame, op::ForOp)
     lower, upper, step = operand(fr, op.lower), operand(fr, op.upper), operand(fr, op.step)
     if lower isa Integer && upper isa Integer && step isa Integer
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
+        unrolled = Unrolled(fr)
         while lower < upper && (unassigned(carries) || !any(has_traced, carries))
             bind!(fr, op.iv_arg, lower)
             carries = iteration(fr, op.body, carries)
             lower += step
+            count!(unrolled)
         end
         lower < upper || return carries
     end
@@ -233,6 +235,7 @@ end
 function emit_loop(fr::Frame, op::WhileOp)
     has_return(op) && unsupported(fr, "`return` inside a loop")
     carries = operands(fr, op.init_values)
+    unrolled = Unrolled(fr)
     while true
         bind!(fr, op.before.args, carries)
         outcome = emit_block(fr, op.before)
@@ -240,6 +243,7 @@ function emit_loop(fr::Frame, op::WhileOp)
         outcome.condition isa Bool && !any(has_traced, outcome.values) || break
         outcome.condition || return outcome.values
         carries = iteration(fr, op.after, outcome.values)
+        count!(unrolled)
     end
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
@@ -247,6 +251,30 @@ function emit_loop(fr::Frame, op::WhileOp)
 end
 
 unassigned(carries::Tuple) = any(v -> v isa MissingTracedValue, carries)
+
+# Every host iteration of a loop that emits operations adds them to the
+# program. Past this many such iterations, say once how to roll the loop.
+const UNROLL_WARNING = Ref(256)
+
+mutable struct Unrolled
+    const frame::Frame
+    emissions::Int
+    iterations::Int
+end
+Unrolled(fr::Frame) = Unrolled(fr, EMISSIONS[], 0)
+
+function count!(u::Unrolled)
+    EMISSIONS[] == u.emissions && return nothing
+    u.emissions = EMISSIONS[]
+    u.iterations += 1
+    u.iterations == UNROLL_WARNING[] + 1 && @warn(
+        "a loop is being unrolled: more than $(UNROLL_WARNING[]) of its iterations " *
+            "emit operations ($(describe(u.frame))). Annotate it with `@trace for` or " *
+            "`@trace while` to roll it into a `stablehlo.while` instead.",
+        maxlog = 1,
+    )
+    return nothing
+end
 
 function iteration(fr::Frame, body::Block, carries::Tuple)
     bind!(fr, body.args, carries)
@@ -262,12 +290,14 @@ end
 # first carry is the `done` flag.
 function emit_loop(fr::Frame, op::LoopOp)
     carries = operands(fr, op.init_values)
+    unrolled = Unrolled(fr)
     local done
     while true
         done, carries... = iteration_of_general_loop(fr, op.body, carries)
         done isa Bool || break
         done && return carries
         any(has_traced, carries) && break
+        count!(unrolled)
     end
     # The last decision may already be traced: the rolled loop starts from it.
     return roll(fr, op, (carry(fr, done), map(v -> carry(fr, v), carries)...))
