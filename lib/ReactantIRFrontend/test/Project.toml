@@ -1,0 +1,14 @@
+[deps]
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+FileCheck = "4e644321-382b-4b05-b0b6-5d23c3d944fb"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantIRFrontend = "5a1b3c2e-6f8d-4e7a-9b0c-1d2e3f4a5b6c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+Reactant = {path = "../../.."}
+ReactantIRFrontend = {path = ".."}
+
+[extras]
+Reactant_jll = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
