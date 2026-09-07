@@ -198,7 +198,13 @@ struct Loop
     frame::Frame
     op::Union{WhileOp,ForOp,LoopOp}
     keys::Vector{Any}
+    bound::Int   # position among the invariants of a counted loop's carried bound, or 0
 end
+
+# Key of a counted loop's bound among its invariants when the bound is a host
+# value: it is not bound in the frame, the condition reads it off the region.
+struct Bound end
+bind!(::Frame, ::Bound, @nospecialize(_)) = nothing
 
 const CURRENT_LOOP = Base.ScopedValues.ScopedValue{Union{Nothing,Loop}}(nothing)
 
@@ -316,7 +322,16 @@ end
 function roll(fr::Frame, op::Union{WhileOp,ForOp,LoopOp}, carries::Tuple)
     extra = op isa ForOp ? Any[op.upper, op.step] : Any[]
     keys, invariants = traced_captures(fr, captures(op, extra, nothing))
-    Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys) begin
+    bound = 0
+    if op isa ForOp && operand(fr, op.upper) isa Number
+        # Enzyme recognizes the induction variable only if its limit is defined
+        # outside the loop; a host bound would be a constant inside the condition
+        # region. Carry it as an invariant, as `@trace for` does.
+        push!(keys, Bound())
+        invariants = (invariants..., Ops.constant(operand(fr, op.upper)))
+        bound = length(invariants)
+    end
+    Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, bound) begin
         Ops.while_loop(
             LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
         )
@@ -361,7 +376,8 @@ function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
         update!(fr, carries, iteration_of_general_loop(fr, op.body, rest))
     else
         iv, rest = carries[1], Base.tail(carries)
-        role === :condition && return traced(<)(iv, operand(fr, op.upper))
+        limit = loop.bound == 0 ? operand(fr, op.upper) : invariants[loop.bound]
+        role === :condition && return traced(<)(iv, limit)
         bind!(fr, op.iv_arg, iv)
         bind!(fr, op.body.args, rest)
         next = (emit_block(fr, op.body)::Yielded).values
