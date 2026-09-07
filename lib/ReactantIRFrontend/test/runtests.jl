@@ -469,6 +469,24 @@ const y = Float32[-1, -2]
             return s
         end
         @test agrees(scalar_sum, (x,))
+        # Julia 1.11 keeps the values a `try` body reads in slots, which left the
+        # arrays as loop carries: the loops must carry nothing here and the
+        # writes must land in the argument itself.
+        function stamp_grid!(h, a, b)
+            m, n = size(h)
+            for i in 1:m
+                for j in 1:n
+                    @allowscalar h[i, j] = a[i, j] + b[i, j]
+                end
+            end
+            return nothing
+        end
+        grid = R(zeros(Float32, 2, 3))
+        a = Float32[1 2 3; 4 5 6]
+        b = Float32[0.5 1.5 2.5; 3.5 4.5 5.5]
+        Reactant.@jit structured(stamp_grid!)(grid, R(a), R(b))
+        @test host(grid) ≈ a .+ b
+        @test !occursin("stablehlo.while", hlo(stamp_grid!, zeros(Float32, 2, 3), a, b))
         # A handler that would only run on a trace-time exception is dropped.
         function protected(x)
             try

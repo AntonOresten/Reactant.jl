@@ -51,7 +51,7 @@ function resolve(@nospecialize(sig::Type), world::UInt)
             Resolution(nothing, valid_worlds)
         else
             mi = specialization(interp, match, sig)
-            ir, _ = CC.typeinf_ircode(interp, mi, nothing)
+            ir, inferred_worlds = infer(interp, mi)
             ir === nothing && throw(FrontendError("inference of $(sig) failed"))
             ir = strip_exception_handling!(ir)
             STRUCTURIZER_HOISTS || dedup_getfield!(ir)
@@ -66,11 +66,29 @@ function resolve(@nospecialize(sig::Type), world::UInt)
                     ),
                 )
             end
-            valid_worlds = worlds_intersection(valid_worlds, sci.valid_worlds)
+            valid_worlds = worlds_intersection(valid_worlds, inferred_worlds)
             Resolution(Code(sci, match.method, mi.sparam_vals, valid_worlds), valid_worlds)
         end
         RESOLUTIONS[sig] = resolution
         return resolution
+    end
+end
+
+# The optimized IR of a specialization, with the worlds its inference is valid
+# in. Julia 1.12 records those on the `IRCode`; 1.11 only on the inference
+# frame, so there the optimizer is run by hand, as `typeinf_ircode` does.
+@static if VERSION >= v"1.12-"
+    function infer(interp::Interpreter, mi::Core.MethodInstance)
+        ir, _ = CC.typeinf_ircode(interp, mi, nothing)
+        return ir, ir === nothing ? nothing : ir.valid_worlds
+    end
+else
+    function infer(interp::Interpreter, mi::Core.MethodInstance)
+        frame = CC.typeinf_frame(interp, mi, false)
+        frame === nothing && return nothing, nothing
+        opt = CC.OptimizationState(frame, interp)
+        ir = CC.run_passes_ipo_safe(opt.src, opt, frame.result, nothing)
+        return ir, frame.valid_worlds
     end
 end
 
@@ -102,13 +120,105 @@ function strip_exception_handling!(ir::CC.IRCode)
         if stmt isa Core.EnterNode
             found = true
             CC.kill_edge!(ir, CC.block_for_inst(ir.cfg, i), stmt.catch_dest)
-            ir.stmts[i][:stmt] = nothing
+            setstmt!(ir, i, nothing)
         elseif stmt isa Core.UpsilonNode ||
             (stmt isa Expr && stmt.head in (:leave, :pop_exception))
-            ir.stmts[i][:stmt] = nothing
+            setstmt!(ir, i, nothing)
         end
     end
-    return found ? CC.compact!(ir, true) : ir
+    found || return ir
+    return fold_trivial_phis!(decide_literal_branches!(CC.compact!(ir, true)))
+end
+
+# Julia 1.11 lowers `finally` to one shared body that then dispatches on a
+# state value. With the handler gone the state is a constant, and the branch
+# that would rethrow compares two literals. Deciding it here removes that dead
+# throwing exit before structurization, which would otherwise carry it out of
+# an enclosing loop.
+function decide_literal_branches!(ir::CC.IRCode)
+    decided = false
+    for (b, block) in enumerate(ir.cfg.blocks)
+        i = last(block.stmts)
+        t = ir.stmts[i][:stmt]
+        t isa Core.GotoIfNot || continue
+        taken = literal_condition(ir, t.cond)
+        taken === nothing && continue
+        if taken
+            setstmt!(ir, i, nothing)
+            CC.kill_edge!(ir, b, t.dest)
+        else
+            setstmt!(ir, i, Core.GotoNode(t.dest))
+            CC.kill_edge!(ir, b, b + 1)
+        end
+        decided = true
+    end
+    return decided ? CC.compact!(ir, true) : ir
+end
+
+function literal_condition(ir::CC.IRCode, @nospecialize(cond))
+    cond isa Bool && return cond
+    cond isa Core.SSAValue || return nothing
+    stmt = ir.stmts[cond.id][:stmt]
+    is_call(stmt, ===, 2) || return nothing
+    a, b = literal(stmt.args[2]), literal(stmt.args[3])
+    (a === nothing || b === nothing) && return nothing
+    return a[] === b[]
+end
+
+# A literal operand, boxed so that `nothing` itself can be one.
+function literal(@nospecialize(x))
+    x isa QuoteNode && (x = x.value)
+    x isa Union{Core.SSAValue,Core.Argument,GlobalRef,Expr,Core.PhiNode} && return nothing
+    return Ref{Any}(x)
+end
+
+# Compaction folds a phi with one edge into its value, and may leave a loop
+# phi that merges a value only with itself: Julia 1.11 saves every variable a
+# `try` body reads in a slot, so an array only mutated in a loop becomes such a
+# phi once the catch edge is gone, and would then be a loop carry that rolls the
+# loop from its first iteration. Rename the uses of such phis to their value.
+function fold_trivial_phis!(ir::CC.IRCode)
+    rename = Dict{Int,Any}()
+    function target(@nospecialize(v))
+        seen = 0
+        while v isa Core.SSAValue && haskey(rename, v.id) && (seen += 1) <= length(rename)
+            v = rename[v.id]
+        end
+        return v
+    end
+    # A phi becomes trivial once the phis it merges with are folded (the header
+    # of a loop merging an inner loop's exit), so iterate to a fixed point.
+    changed = true
+    while changed
+        changed = false
+        for i in 1:length(ir.stmts)
+            haskey(rename, i) && continue
+            phi = ir.stmts[i][:stmt]
+            phi isa Core.PhiNode || continue
+            value = Ref{Any}()
+            trivial = all(eachindex(phi.values)) do k
+                isassigned(phi.values, k) || return false
+                v = target(phi.values[k])
+                v === Core.SSAValue(i) && return true
+                isassigned(value) || (value[] = v)
+                return v === value[]
+            end
+            trivial && isassigned(value) || continue
+            rename[i] = value[]
+            changed = true
+        end
+    end
+    isempty(rename) && return ir
+    for i in 1:length(ir.stmts)
+        setstmt!(ir, i, haskey(rename, i) ? nothing : CC.ssamap(target, ir.stmts[i][:stmt]))
+    end
+    return ir
+end
+
+# Writing a statement goes through the compiler's own `setindex!`: on Julia
+# 1.11 it is not `Base.setindex!`, which has no method for an `Instruction`.
+function setstmt!(ir::CC.IRCode, i::Int, @nospecialize(stmt))
+    return CC.setindex!(ir.stmts[i], stmt, :stmt)
 end
 
 # Reading a field of an immutable value is pure, so a read dominated by an
@@ -148,9 +258,8 @@ function dedup_getfield!(ir::CC.IRCode)
     end
     isempty(rename) && return ir
     for i in 1:length(ir.stmts)
-        ir.stmts[i][:stmt] = CC.ssamap(
-            v -> Core.SSAValue(get(rename, v.id, v.id)), ir.stmts[i][:stmt]
-        )
+        renamed = CC.ssamap(v -> Core.SSAValue(get(rename, v.id, v.id)), ir.stmts[i][:stmt])
+        setstmt!(ir, i, renamed)
     end
     return ir
 end
