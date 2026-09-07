@@ -325,6 +325,33 @@ const y = Float32[-1, -2]
             @test_skip agrees(for_in_for, (x,))
         end
 
+        # A loop rolled inside a general loop's body once inherited that body's
+        # exit flag and yielded one value too many. `stamp!` has no value escaping
+        # its inner loop, so the released structurizer handles it as well.
+        function stamp!(B, n)
+            for i in 1:n
+                for j in 1:3
+                    Reactant.allowscalar(() -> B[i, j] = B[i, j] + i)
+                end
+            end
+            return B
+        end
+        @test agrees(stamp!, (zeros(Float32, 4, 4), 2))
+        function double_until(x)
+            while true
+                for j in 1:3
+                    x = x .* 2
+                end
+                sum(x) > 100 && break
+            end
+            return x
+        end
+        if ReactantIRFrontend.STRUCTURIZER_HOISTS
+            @test agrees(double_until, (x,))
+        else
+            @test_skip agrees(double_until, (x,))
+        end
+
         function loop_with_branch(x)
             while sum(x) > 1.0f0
                 if sum(x) > 8.0f0

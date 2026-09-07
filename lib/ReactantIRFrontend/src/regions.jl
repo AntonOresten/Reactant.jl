@@ -308,7 +308,9 @@ function Reactant.call_with_reactant(::LoopBody, carries, invariants)
 end
 
 function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
-    fr = fork(loop.frame)
+    # A loop rolled inside a general loop's body must not inherit that body's
+    # `exits`: its own `continue` yields carries, not a `done` flag.
+    fr = fork(loop.frame; exits=false)
     bind!(fr, loop.keys, invariants)
     op = loop.op
     if op isa WhileOp

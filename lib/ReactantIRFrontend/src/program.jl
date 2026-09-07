@@ -25,7 +25,7 @@ Julia.
 """
 structured(f) = Program(f)
 
-struct Program{F}
+struct Program{F} <: Function
     f::F
 end
 
