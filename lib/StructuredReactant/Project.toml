@@ -1,5 +1,5 @@
-name = "ReactantIRFrontend"
-uuid = "5a1b3c2e-6f8d-4e7a-9b0c-1d2e3f4a5b6c"
+name = "StructuredReactant"
+uuid = "d9304b73-2dfb-44d9-84cc-67fa0b51c9dd"
 authors = ["Anton Oresten"]
 version = "0.1.0"
 

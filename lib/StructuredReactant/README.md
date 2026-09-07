@@ -1,9 +1,9 @@
-# ReactantIRFrontend
+# StructuredReactant
 
 Ordinary Julia control flow for Reactant, without `@trace`.
 
 ```julia
-using Reactant, ReactantIRFrontend
+using Reactant, StructuredReactant
 
 function normalize(x)
     n = 0
@@ -30,7 +30,7 @@ them explicitly makes the frontend the default:
 
 ```julia
 using Reactant
-using ReactantIRFrontend: @compile, @jit, @code_hlo
+using StructuredReactant: @compile, @jit, @code_hlo
 
 @jit normalize(x)
 ```
@@ -118,7 +118,7 @@ once a loop over it is rolled; declare such a counter `local`.
 ## Running the tests
 
 ```sh
-julia --project=lib/ReactantIRFrontend/test lib/ReactantIRFrontend/test/runtests.jl
+julia --project=lib/StructuredReactant/test lib/StructuredReactant/test/runtests.jl
 ```
 
 `test/migration.jl` is a separate experiment: it makes `@trace` an identity

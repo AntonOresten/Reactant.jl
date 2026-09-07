@@ -1,7 +1,7 @@
 using Test
-using Reactant, ReactantIRFrontend, Enzyme
+using Reactant, StructuredReactant, Enzyme
 using Reactant: @allowscalar
-using ReactantIRFrontend: FrontendError
+using StructuredReactant: FrontendError
 
 Reactant.set_default_backend("cpu")
 
@@ -33,7 +33,7 @@ end
 const x = Float32[1, 2]
 const y = Float32[-1, -2]
 
-@testset "ReactantIRFrontend" begin
+@testset "StructuredReactant" begin
     @testset "branches" begin
         helper(x) = sum(x) > 0.0f0 ? x + x : x - x
         outer(x) = helper(x)
@@ -319,7 +319,7 @@ const y = Float32[-1, -2]
         # IRStructurizer up to 0.6.4 fails to structurize a `for` nested directly
         # in a `for` ("SSA values used but not defined"), for plain host code too;
         # fixed upstream (maleadt/IRStructurizer.jl#61) in the release after it.
-        if ReactantIRFrontend.STRUCTURIZER_HOISTS
+        if StructuredReactant.STRUCTURIZER_HOISTS
             @test agrees(for_in_for, (x,))
         else
             @test_skip agrees(for_in_for, (x,))
@@ -346,7 +346,7 @@ const y = Float32[-1, -2]
             end
             return x
         end
-        if ReactantIRFrontend.STRUCTURIZER_HOISTS
+        if StructuredReactant.STRUCTURIZER_HOISTS
             @test agrees(double_until, (x,))
         else
             @test_skip agrees(double_until, (x,))
@@ -360,8 +360,8 @@ const y = Float32[-1, -2]
             end
             return x
         end
-        threshold = ReactantIRFrontend.UNROLL_WARNING[]
-        ReactantIRFrontend.UNROLL_WARNING[] = 2
+        threshold = StructuredReactant.UNROLL_WARNING[]
+        StructuredReactant.UNROLL_WARNING[] = 2
         try
             @test_logs (:warn, r"unrolled") match_mode = :any Reactant.@compile structured(
                 stamp_all!
@@ -369,7 +369,7 @@ const y = Float32[-1, -2]
                 R(Float32[1, 2, 3, 4])
             )
         finally
-            ReactantIRFrontend.UNROLL_WARNING[] = threshold
+            StructuredReactant.UNROLL_WARNING[] = threshold
         end
 
         function loop_with_branch(x)
@@ -599,27 +599,27 @@ const y = Float32[-1, -2]
             return sum(x) > 0 ? x .* y .* scale : x .- y
         end
         x, y = Float32[1, -2, 3], Float32[2, 2, 2]
-        compiled = ReactantIRFrontend.@compile bump(R(x), R(y))
+        compiled = StructuredReactant.@compile bump(R(x), R(y))
         @test matches(compiled(R(x), R(y)), bump(x, y))
         @test matches(compiled(R(-x), R(y)), bump(-x, y))
-        @test matches((ReactantIRFrontend.@jit sync = true bump(R(x), R(y))), bump(x, y))
+        @test matches((StructuredReactant.@jit sync = true bump(R(x), R(y))), bump(x, y))
         @test matches(
-            ReactantIRFrontend.@jit(bump(R(x), R(y); scale=2)), bump(x, y; scale=2)
+            StructuredReactant.@jit(bump(R(x), R(y); scale=2)), bump(x, y; scale=2)
         )
-        ir = string(ReactantIRFrontend.@code_hlo optimize = false bump(R(x), R(y)))
+        ir = string(StructuredReactant.@code_hlo optimize = false bump(R(x), R(y)))
         @test occursin("stablehlo.if", ir)
         half(v) = v > 0 ? v / 2 : v
-        @test matches(ReactantIRFrontend.@jit(half.(R(x))), half.(x))
+        @test matches(StructuredReactant.@jit(half.(R(x))), half.(x))
         @test matches(
-            ReactantIRFrontend.compile(bump, (R(x), R(y)))(R(x), R(y)), bump(x, y)
+            StructuredReactant.compile(bump, (R(x), R(y)))(R(x), R(y)), bump(x, y)
         )
         @test occursin(
             "stablehlo.if",
-            string(ReactantIRFrontend.code_hlo(bump, (R(x), R(y)); optimize=false)),
+            string(StructuredReactant.code_hlo(bump, (R(x), R(y)); optimize=false)),
         )
         # An explicit import shadows Reactant's exported macros without ambiguity.
         m = Module()
-        Core.eval(m, :(using Reactant; using ReactantIRFrontend: @jit))
+        Core.eval(m, :(using Reactant; using StructuredReactant: @jit))
         Core.eval(m, :(pick(x) = sum(x) > 0 ? x : -x))
         @test matches(Core.eval(m, :(@jit pick($(R(-x))))), -(-x))
     end

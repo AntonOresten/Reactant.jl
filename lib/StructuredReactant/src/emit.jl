@@ -208,15 +208,12 @@ emit_stmt(::Frame, ::Nothing) = nothing
 emit_stmt(fr::Frame, op::IfOp) = emit_if(fr, op, nothing).values
 emit_stmt(fr::Frame, op::Union{WhileOp,ForOp,LoopOp}) = emit_loop(fr, op)
 emit_stmt(fr::Frame, ::Core.PhiNode) = unsupported(fr, "unstructured control flow")
-function emit_stmt(fr::Frame, ::Union{Core.GotoNode,Core.GotoIfNot})
-    return unsupported(fr, "unstructured control flow")
-end
-function emit_stmt(fr::Frame, ::Union{Core.PhiCNode,Core.UpsilonNode,Core.EnterNode})
-    return unsupported(fr, "`try`/`catch`")
-end
-function emit_stmt(fr::Frame, ::Core.ReturnNode)
-    return unsupported(fr, "code after a call that always throws")
-end
+emit_stmt(fr::Frame, ::Union{Core.GotoNode,Core.GotoIfNot}) =
+    unsupported(fr, "unstructured control flow")
+emit_stmt(fr::Frame, ::Union{Core.PhiCNode,Core.UpsilonNode,Core.EnterNode}) =
+    unsupported(fr, "`try`/`catch`")
+emit_stmt(fr::Frame, ::Core.ReturnNode) =
+    unsupported(fr, "code after a call that always throws")
 
 const SILENT_EXPRESSIONS = (
     :meta,
