@@ -208,12 +208,15 @@ emit_stmt(::Frame, ::Nothing) = nothing
 emit_stmt(fr::Frame, op::IfOp) = emit_if(fr, op, nothing).values
 emit_stmt(fr::Frame, op::Union{WhileOp,ForOp,LoopOp}) = emit_loop(fr, op)
 emit_stmt(fr::Frame, ::Core.PhiNode) = unsupported(fr, "unstructured control flow")
-emit_stmt(fr::Frame, ::Union{Core.GotoNode,Core.GotoIfNot}) =
-    unsupported(fr, "unstructured control flow")
-emit_stmt(fr::Frame, ::Union{Core.PhiCNode,Core.UpsilonNode,Core.EnterNode}) =
-    unsupported(fr, "`try`/`catch`")
-emit_stmt(fr::Frame, ::Core.ReturnNode) =
-    unsupported(fr, "code after a call that always throws")
+function emit_stmt(fr::Frame, ::Union{Core.GotoNode,Core.GotoIfNot})
+    return unsupported(fr, "unstructured control flow")
+end
+function emit_stmt(fr::Frame, ::Union{Core.PhiCNode,Core.UpsilonNode,Core.EnterNode})
+    return unsupported(fr, "`try`/`catch`")
+end
+function emit_stmt(fr::Frame, ::Core.ReturnNode)
+    return unsupported(fr, "code after a call that always throws")
+end
 
 const SILENT_EXPRESSIONS = (
     :meta,
@@ -268,6 +271,8 @@ function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
         :jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields)
     )
     T <: NamedTuple && return NamedTuple{fieldnames(T)}(Tuple(fields))
+    # `a:b` inlined to a `UnitRange`; with traced endpoints it is Reactant's range.
+    T <: UnitRange && return Reactant.call_with_reactant(:, fields[1], fields[2])
     wrapper = T.name.wrapper
     if isempty(methods(wrapper))   # a closure type has no constructor
         R = reparameterize(T, fields)

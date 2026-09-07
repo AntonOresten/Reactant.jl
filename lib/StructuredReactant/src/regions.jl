@@ -106,9 +106,9 @@ function Reactant.call_with_reactant(r::Region, values...)
     bind!(fr, r.keys, values)
     outcome = emit_block(fr, r.block, 1, r.continuation)
     result = if outcome isa Yielded
-        outcome.values
+        map(regionvalue, outcome.values)
     elseif outcome isa Returned
-        (outcome.value,)   # the builder expects a tuple
+        (regionvalue(outcome.value),)   # the builder expects a tuple
     else
         unsupported(fr, "a loop condition inside a branch")
     end
@@ -156,7 +156,7 @@ function emit_if(fr::Frame, op::IfOp, k::Union{Nothing,Continuation})
     then_region = Region(fr, op.then_region, keys, k, result_type, other)
     else_region = Region(fr, op.else_region, keys, k, result_type, other)
     result = Ops.if_condition(
-        condition, then_region, else_region, values...; track_numbers=Number
+        condition, then_region, else_region, values...; track_numbers=Union{}
     )
     k === nothing && return Yielded(Tuple(result))
     # With a continuation both branches produced the enclosing block's outcome.
@@ -223,7 +223,7 @@ function roll_for(fr::Frame, op::ForOp, lower, upper, step, carries::Tuple)
     carries = (Ops.constant(zero(T)), carries...)
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, length(invariants), 0) begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
+            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
         )
     end
     return Base.tail(carries)
@@ -311,7 +311,7 @@ function roll(fr::Frame, op::Union{WhileOp,LoopOp}, carries::Tuple)
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, 0, 0) begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
+            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
         )
     end
 
@@ -391,6 +391,11 @@ function update!(fr::Frame, carries::Union{Tuple,NamedTuple}, next)
     end
     return nothing
 end
+
+# The builders are not asked to promote numbers, since the tracer would then
+# also promote the shape metadata of array wrappers among the captures; a host
+# number yielded by a branch is promoted here so that both branches agree.
+regionvalue(@nospecialize(x)) = x isa Number ? Ops.constant(x) : x
 function update!(fr::Frame, c::Iteration, next)
     next isa Iteration || unsupported(fr, "a loop-carried range iterator that changes type")
     update!(fr, c.i, next.i)
@@ -475,7 +480,7 @@ function roll_counted(fr::Frame, op::LoopOp, k::Int, carries::Tuple)
     scope = Loop(fr, op, keys, length(invariants), k + 1)
     Base.ScopedValues.@with CURRENT_LOOP => scope begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Number
+            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
         )
     end
     return Base.tail(carries)
