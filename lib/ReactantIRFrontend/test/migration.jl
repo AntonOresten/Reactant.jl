@@ -1,6 +1,6 @@
 # Migration experiment: how much of one of Reactant's own test files passes
-# when `@trace` is an identity macro and every compilation goes through
-# `structured`? Not part of the test suite. Run in its own process, naming the
+# when `@trace` on control flow is an identity macro (its options and call
+# outlining stay) and every compilation goes through `structured`? Not part of the test suite. Run in its own process, naming the
 # file under `test/core` (`control_flow` by default, `autodiff` is the other
 # one that exercises control flow):
 #
@@ -45,8 +45,16 @@ for entry in (:compile, :code_hlo, :code_mhlo, :code_xla)
     end
 end
 
+# A bare `@trace` on `if`, `for` or `while` is the annotation the frontend makes
+# unnecessary and becomes an identity. Everything else `@trace` does is kept:
+# options (`checkpointing`, `mincut`, `track_numbers`) are the hints it remains
+# the carrier of, and `@trace f(x)` or `@trace function ...` outline calls.
+const TRACE_WORLD = Base.get_world_counter()   # the original macro lives here
 @eval Reactant.ReactantCore macro trace(args...)
-    return esc(last(args))
+    if length(args) == 1 && Meta.isexpr(only(args), (:if, :for, :while))
+        return esc(only(args))
+    end
+    return Base.invoke_in_world($TRACE_WORLD, var"@trace", __source__, __module__, args...)
 end
 
 file = isempty(ARGS) ? "control_flow" : only(ARGS)
