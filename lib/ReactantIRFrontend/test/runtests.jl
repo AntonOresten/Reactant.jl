@@ -555,6 +555,18 @@ const y = Float32[-1, -2]
         loop_gradient(x) = Enzyme.gradient(Reverse, structured(loop_loss), x)[1]
         @test host(Reactant.@jit loop_gradient(R(x))) ≈ fill(0.125f0, 2)
 
+        # A body that must be cached for the reverse pass: Enzyme finds the loop's
+        # induction variable only when its bound is a loop argument.
+        function sines(x)
+            for i in 1:3
+                x = sin.(x)
+            end
+            return sum(x)
+        end
+        sines_gradient(x) = Enzyme.gradient(Reverse, structured(sines), x)[1]
+        @test host(Reactant.@jit sines_gradient(R(x))) ≈
+            Enzyme.gradient(Reverse, sines, x)[1]
+
         # Second order once aborted the process: native inference of the entry
         # point reached the emitter and typed `slope` on a traced number without
         # Reactant's overlays, compiling its `gradient` under native Enzyme.
