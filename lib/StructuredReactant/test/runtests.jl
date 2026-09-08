@@ -50,6 +50,38 @@ apply(x) = x .* gain
 set_gain!(value) = (global gain = value)
 end
 
+# These helpers have host-only signatures, but still need Reactant's compilation
+# context. HiddenLoop also exercises runtime detection through an untyped field.
+module HostBoundary
+using Reactant
+
+function tables(x)
+    angles = Float32.(1:size(x, 1)) .* 0.01f0
+    c, s = cos.(angles), sin.(angles)
+    return x .* c .+ s
+end
+function context_table(n)
+    scale = Reactant.ReactantCore.within_compile() ? 2.0f0 : 3.0f0
+    return cos.(Float32.(1:n)) .* scale
+end
+context_user(x) = x .* context_table(size(x, 1))
+host_gain(x::Float32) = x + 1.0f0
+Base.Experimental.@overlay Reactant.REACTANT_METHOD_TABLE host_gain(x::Float32) = x + 2.0f0
+overlay_user(x) = x .* host_gain.(Float32.(1:size(x, 1)))
+
+struct HiddenLoop
+    value::Any
+end
+function (h::HiddenLoop)()
+    x = h.value
+    for i in 1:3
+        x = sum(x) > 0 ? x .* 0.5f0 : -x
+    end
+    return x
+end
+hidden_user(x) = HiddenLoop(x)()
+end
+
 @testset "StructuredReactant" begin
     @testset "branches" begin
         helper(x) = sum(x) > 0.0f0 ? x + x : x - x
@@ -610,6 +642,27 @@ end
         @test_throws FrontendError Reactant.@compile structured(identity_branch)(
             R(0.0f0), R(-0.0f0)
         )
+    end
+
+    @testset "host call boundary" begin
+        for f in (HostBoundary.tables, HostBoundary.context_user, HostBoundary.overlay_user)
+            rx = R(ones(Float32, 8))
+            @test host(Reactant.@jit structured(f)(rx)) ≈ host(Reactant.@jit f(rx))
+        end
+        @test agrees(HostBoundary.hidden_user, (x,), (y,))
+        # A traced condition behind an Any field must still reach the frontend.
+        @test occursin("stablehlo.if", hlo(HostBoundary.hidden_user, x))
+
+        # The host broadcast loops must stay native, even inside a traced caller.
+        # Check the boundary directly rather than asserting a wall-clock budget.
+        SR = StructuredReactant
+        sig = Tuple{typeof(HostBoundary.tables),Reactant.TracedRArray{Float32,1}}
+        code = SR.resolve(sig, Base.get_world_counter()).code
+        @test !any(SR.eachblock(code.sci)) do block
+            return any(values(block.body)) do entry
+                return entry.stmt isa Union{SR.WhileOp,SR.ForOp,SR.LoopOp}
+            end
+        end
     end
 
     @testset "integration" begin

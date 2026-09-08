@@ -64,12 +64,16 @@ function involves_reactant(@nospecialize(T))
     return false
 end
 
-# Foreign calls and exception handlers stay out of line, where they run natively;
-# sources must stay uncompressed for the policy to see them.
+# Keep host loops out of traced callers: otherwise bulk host work becomes one
+# interpreted statement at a time. Small host helpers still inline, including
+# iteration primitives whose state may become traced when their caller rolls a
+# loop. Sources stay uncompressed so the policy can inspect their control flow.
 CC.may_compress(::Interpreter) = false
 
 function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
-    return inlines_leaf(info) || opaque_to_emitter(src)
+    return any_call_match(leaf_match, info) ||
+           opaque_to_emitter(src) ||
+           (contains_loop(src) && any_call_match(host_match, info))
 end
 
 # Julia 1.12 turned `inlining_policy`, which returns the source to inline or
@@ -113,15 +117,36 @@ function opaque_to_emitter(@nospecialize(src))
     end
 end
 
-function inlines_leaf(info::CC.MethodMatchInfo)
-    return any(m -> isleaf(m.method, m.spec_types), info.results.matches)
+function contains_loop(@nospecialize(src))
+    if src isa Core.CodeInfo
+        for (i, stmt) in enumerate(src.code)
+            stmt isa Core.GotoNode && stmt.label <= i && return true
+            stmt isa Core.GotoIfNot && stmt.dest <= i && return true
+        end
+    elseif src isa CC.IRCode
+        for (i, block) in enumerate(src.cfg.blocks)
+            any(succ -> succ <= i, block.succs) && return true
+        end
+    end
+    return false
 end
-inlines_leaf(info::CC.UnionSplitInfo) = any(inlines_leaf, union_split(info))
-inlines_leaf(info::CC.ConstCallInfo) = inlines_leaf(info.call)
-inlines_leaf(info::CC.ApplyCallInfo) = inlines_leaf(info.call)
-inlines_leaf(info::CC.UnionSplitApplyCallInfo) = any(inlines_leaf, info.infos)
-inlines_leaf(info::CC.InvokeCallInfo) = isleaf(info.match.method, info.match.spec_types)
-inlines_leaf(@nospecialize(info::CC.CallInfo)) = false
+
+function any_call_match(predicate, info::CC.MethodMatchInfo)
+    return any(predicate, info.results.matches)
+end
+function any_call_match(predicate, info::CC.UnionSplitInfo)
+    return any(Base.Fix1(any_call_match, predicate), union_split(info))
+end
+any_call_match(predicate, info::CC.ConstCallInfo) = any_call_match(predicate, info.call)
+any_call_match(predicate, info::CC.ApplyCallInfo) = any_call_match(predicate, info.call)
+function any_call_match(predicate, info::CC.UnionSplitApplyCallInfo)
+    return any(Base.Fix1(any_call_match, predicate), info.infos)
+end
+any_call_match(predicate, info::CC.InvokeCallInfo) = predicate(info.match)
+any_call_match(predicate, @nospecialize(info::CC.CallInfo)) = false
+
+leaf_match(match::Core.MethodMatch) = isleaf(match.method, match.spec_types)
+host_match(match::Core.MethodMatch) = !involves_reactant(match.spec_types)
 
 # Julia 1.12 renamed the field holding a union split's matches.
 @static if hasfield(CC.UnionSplitInfo, :split)

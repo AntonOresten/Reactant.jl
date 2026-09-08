@@ -397,7 +397,8 @@ function reparameterize(T::DataType, fields::Vector{Any})
     return T.name.wrapper{params...}
 end
 
-# Builtins and calls without traced arguments run in Julia.
+# Calls without traced arguments run natively through Reactant: even a host-only
+# helper can depend on overlays or `within_compile()`. Builtins are handled here.
 function emit_call(fr::Frame, @nospecialize(f), args::Vector{Any})
     if f isa Core.IntrinsicFunction   # intrinsics are builtins too; test them first
         return emit_intrinsic(fr, f, args)
@@ -406,7 +407,7 @@ function emit_call(fr::Frame, @nospecialize(f), args::Vector{Any})
     elseif has_traced(f) || any(has_traced, args)
         return emit_method(f, args, fr)
     end
-    return f(args...)
+    return Reactant.call_with_reactant(f, args...)
 end
 
 # Keep the result element type fixed. `map` widens a vector from its first
