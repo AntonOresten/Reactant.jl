@@ -4,6 +4,12 @@ struct Code
     method::Method
     sparams::Core.SimpleVector
     valid_worlds::CC.WorldRange
+    # Memoized per control-flow op: does it return, does it leave the loop.
+    returns::IdDict{Any,Bool}
+    exits::IdDict{Any,Bool}
+end
+function Code(sci, method, sparams, valid_worlds)
+    return Code(sci, method, sparams, valid_worlds, IdDict(), IdDict())
 end
 
 # What a call signature dispatches to. `code === nothing` marks a leaf.
@@ -26,39 +32,48 @@ end
 # What `sig` dispatches to in `world`: `nothing` without a method, a leaf, or
 # the method's structured IR; cached until a method definition invalidates it.
 function resolve(@nospecialize(sig::Type), world::UInt)
-    return lock(RESOLUTIONS_LOCK) do
-        cached = get(RESOLUTIONS, sig, nothing)
-        cached !== nothing && covers(cached, world) && return cached
-
-        interp = Interpreter(world)
-        match, valid_worlds = CC.findsup(sig, CC.method_table(interp))
-        match === nothing && return nothing
-
-        resolution = if isleaf(match.method, sig)
-            Resolution(nothing, valid_worlds)
-        else
-            mi = specialization(interp, match, sig)
-            ir, inferred_worlds = infer(interp, mi)
-            ir === nothing && throw(FrontendError("inference of $(sig) failed"))
-            ir = strip_exception_handling!(ir)
-            STRUCTURIZER_HOISTS || dedup_getfield!(ir)
-            sci = try
-                StructuredIRCode(ir)
-            catch err
-                message = sprint(showerror, err)
-                throw(
-                    FrontendError(
-                        "the control flow of $(match.method) could not be structured: " *
-                        message,
-                    ),
-                )
-            end
-            valid_worlds = worlds_intersection(valid_worlds, inferred_worlds)
-            Resolution(Code(sci, match.method, mi.sparam_vals, valid_worlds), valid_worlds)
-        end
-        RESOLUTIONS[sig] = resolution
-        return resolution
+    # Not `lock(f, l)`: a closure over `sig` has one type per signature and would
+    # have Julia compile `lock` once for each.
+    lock(RESOLUTIONS_LOCK)
+    try
+        return resolve_locked(sig, world)
+    finally
+        unlock(RESOLUTIONS_LOCK)
     end
+end
+
+function resolve_locked(@nospecialize(sig::Type), world::UInt)
+    cached = get(RESOLUTIONS, sig, nothing)
+    cached !== nothing && covers(cached, world) && return cached
+
+    interp = Interpreter(world)
+    match, valid_worlds = CC.findsup(sig, CC.method_table(interp))
+    match === nothing && return nothing
+
+    resolution = if isleaf(match.method, sig)
+        Resolution(nothing, valid_worlds)
+    else
+        mi = specialization(interp, match, sig)
+        ir, inferred_worlds = infer(interp, mi)
+        ir === nothing && throw(FrontendError("inference of $(sig) failed"))
+        ir = strip_exception_handling!(ir)
+        STRUCTURIZER_HOISTS || dedup_getfield!(ir)
+        sci = try
+            StructuredIRCode(ir)
+        catch err
+            message = sprint(showerror, err)
+            throw(
+                FrontendError(
+                    "the control flow of $(match.method) could not be structured: " *
+                    message,
+                ),
+            )
+        end
+        valid_worlds = worlds_intersection(valid_worlds, inferred_worlds)
+        Resolution(Code(sci, match.method, mi.sparam_vals, valid_worlds), valid_worlds)
+    end
+    RESOLUTIONS[sig] = resolution
+    return resolution
 end
 
 # Julia 1.12 records the valid worlds on the `IRCode`; 1.11 only on the frame,
