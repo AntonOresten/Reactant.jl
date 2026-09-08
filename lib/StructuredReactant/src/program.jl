@@ -37,7 +37,12 @@ function program_call_generator(
 )
     @nospecialize
     rt = try
-        CC._return_type(Interpreter(world), Tuple{P.parameters[1],argtypes...})
+        Base.invoke_in_world(
+            COMPILER_WORLD[],
+            CC._return_type,
+            Interpreter(world),
+            Tuple{P.parameters[1],argtypes...},
+        )
     catch
         Any
     end

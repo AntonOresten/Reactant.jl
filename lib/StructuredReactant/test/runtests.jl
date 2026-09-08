@@ -957,3 +957,5 @@ end
         @test occursin("checked", sprint(showerror, err))
     end
 end
+
+include("cache.jl")

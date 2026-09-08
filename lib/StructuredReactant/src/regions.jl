@@ -573,14 +573,22 @@ function defining(block::Block, @nospecialize(v))
     return entry === nothing ? nothing : entry.stmt
 end
 
-function is_call(@nospecialize(stmt), target, nargs::Int)
+function is_call(
+    @nospecialize(stmt), target, nargs::Int, world::UInt=Base.get_world_counter()
+)
     stmt isa Expr && stmt.head === :call && length(stmt.args) == nargs + 1 || return false
-    return resolves(stmt.args[1], target)
+    return resolves(stmt.args[1], target, world)
 end
 
-function resolves(@nospecialize(f), target)
-    f isa GlobalRef && (f = isdefined(f.mod, f.name) ? getglobal(f.mod, f.name) : missing)
+function resolves(@nospecialize(f), target, world::UInt=Base.get_world_counter())
+    f isa GlobalRef && (f = Base.invoke_in_world(world, global_value, f))
     return f === target
+end
+
+# IR may refer to globals defined after the compiler's initialization world.
+# Read them in the user program's world, including when cleaning up inferred IR.
+function global_value(ref::GlobalRef)
+    return isdefined(ref.mod, ref.name) ? getglobal(ref.mod, ref.name) : missing
 end
 
 is_nothing(@nospecialize(x)) = x === nothing || resolves(x, nothing)

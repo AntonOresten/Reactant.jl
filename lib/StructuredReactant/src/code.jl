@@ -1,25 +1,32 @@
-# The structured IR of one method specialization, cached per call signature.
+# The structured IR and prepared operands of one inferred MethodInstance.
 struct Code
     sci::StructuredIRCode
     method::Method
     sparams::Core.SimpleVector
-    valid_worlds::CC.WorldRange
     # Memoized per control-flow op: does it return, does it leave the loop.
     returns::IdDict{Any,Bool}
     exits::IdDict{Any,Bool}
     blocks::IdDict{Block,PreparedBlock}
 end
-function Code(sci, method, sparams, valid_worlds)
+function Code(sci, method, sparams)
     returns, exits = IdDict{Any,Bool}(), IdDict{Any,Bool}()
-    return Code(
-        sci, method, sparams, valid_worlds, returns, exits, prepare(sci, returns, exits)
-    )
+    return Code(sci, method, sparams, returns, exits, prepare(sci, returns, exits))
 end
 
-# What a call signature dispatches to. `code === nothing` marks a leaf.
-struct Resolution
+# Attached to Julia's CodeInstance, so dependencies invalidate inferred source
+# and prepared code together. Execution buffers belong to Frames, never here.
+mutable struct PreparedCode
     code::Union{Nothing,Code}
-    valid_worlds::CC.WorldRange
+    PreparedCode() = new(nothing)
+end
+
+# Dispatch is cached only within one world: a newly added overload can select a
+# different MethodInstance without invalidating the previously selected one.
+# After a world change we repeat lookup, then reuse the CodeInstance's results.
+struct Resolution
+    code::Union{Nothing,Code} # nothing marks a native leaf
+    world::UInt
+    ci::Union{Nothing,Core.CodeInstance}
 end
 
 # An `IdDict`: its methods do not specialize on the key, a `Dict{Type,...}`'s do,
@@ -28,11 +35,8 @@ const RESOLUTIONS = IdDict{Any,Resolution}()
 const RESOLUTIONS_LOCK = ReentrantLock()
 
 function covers(r::Resolution, world::UInt)
-    return r.valid_worlds.min_world <= world <= r.valid_worlds.max_world
-end
-
-function worlds_intersection(a::CC.WorldRange, b::CC.WorldRange)
-    return CC.WorldRange(max(a.min_world, b.min_world), min(a.max_world, b.max_world))
+    return r.world == world &&
+           (r.ci === nothing || r.ci.min_world <= world <= r.ci.max_world)
 end
 
 # What `sig` dispatches to in `world`: `nothing` without a method, a leaf, or
@@ -42,7 +46,9 @@ function resolve(@nospecialize(sig::Type), world::UInt)
     # have Julia compile `lock` once for each.
     lock(RESOLUTIONS_LOCK)
     try
-        return resolve_locked(sig, world)
+        return Base.invoke_in_world(
+            COMPILER_WORLD[], resolve_locked, sig, world
+        )::Union{Nothing,Resolution}
     finally
         unlock(RESOLUTIONS_LOCK)
     end
@@ -53,50 +59,49 @@ function resolve_locked(@nospecialize(sig::Type), world::UInt)
     cached !== nothing && covers(cached, world) && return cached
 
     interp = Interpreter(world)
-    match, valid_worlds = CC.findsup(sig, CC.method_table(interp))
+    match, _ = CC.findsup(sig, CC.method_table(interp))
     match === nothing && return nothing
 
     resolution = if isleaf(match.method, sig)
-        Resolution(nothing, valid_worlds)
+        Resolution(nothing, world, nothing)
     else
         mi = specialization(interp, match, sig)
-        ir, inferred_worlds = infer(interp, mi)
-        ir === nothing && throw(FrontendError("inference of $(sig) failed"))
-        ir = strip_exception_handling!(ir)
-        STRUCTURIZER_HOISTS || dedup_getfield!(ir)
-        sci = try
-            StructuredIRCode(ir)
-        catch err
-            message = sprint(showerror, err)
-            throw(
-                FrontendError(
-                    "the control flow of $(match.method) could not be structured: " *
-                    message,
-                ),
-            )
+        cache = CacheView{PreparedCode}(CC.cache_owner(interp), world)
+        ci = get(cache, mi, nothing)
+        ci === nothing && (ci = CompilerCaching.typeinf!(interp, mi))
+        ci === nothing && throw(FrontendError("inference of $(sig) failed"))
+        prepared = CompilerCaching.results(cache, ci)
+        if prepared.code === nothing
+            src = CompilerCaching.get_source(ci)
+            if src === nothing
+                ci = CompilerCaching.typeinf!(interp, mi)
+                src = ci === nothing ? nothing : CompilerCaching.get_source(ci)
+            end
+            src === nothing &&
+                throw(FrontendError("inferred source of $(sig) unavailable"))
+            # inflate_ir copies the source: cleanup/structurization must not
+            # mutate code that inference and other resolutions still use.
+            ir = CC.inflate_ir(src, mi)
+            ir = strip_exception_handling!(ir, world)
+            STRUCTURIZER_HOISTS || dedup_getfield!(ir, world)
+            sci = try
+                StructuredIRCode(ir)
+            catch err
+                message = sprint(showerror, err)
+                throw(
+                    FrontendError(
+                        "the control flow of $(match.method) could not be structured: " *
+                        message,
+                    ),
+                )
+            end
+            prepared = CompilerCaching.results(cache, ci)
+            prepared.code = Code(sci, match.method, mi.sparam_vals)
         end
-        valid_worlds = worlds_intersection(valid_worlds, inferred_worlds)
-        Resolution(Code(sci, match.method, mi.sparam_vals, valid_worlds), valid_worlds)
+        Resolution(prepared.code, world, ci)
     end
     RESOLUTIONS[sig] = resolution
     return resolution
-end
-
-# Julia 1.12 records the valid worlds on the `IRCode`; 1.11 only on the frame,
-# so there the optimizer is run by hand, as `typeinf_ircode` does.
-@static if VERSION >= v"1.12-"
-    function infer(interp::Interpreter, mi::Core.MethodInstance)
-        ir, _ = CC.typeinf_ircode(interp, mi, nothing)
-        return ir, ir === nothing ? nothing : ir.valid_worlds
-    end
-else
-    function infer(interp::Interpreter, mi::Core.MethodInstance)
-        frame = CC.typeinf_frame(interp, mi, false)
-        frame === nothing && return nothing, nothing
-        opt = CC.OptimizationState(frame, interp)
-        ir = CC.run_passes_ipo_safe(opt.src, opt, frame.result, nothing)
-        return ir, frame.valid_worlds
-    end
 end
 
 # Traced Bool arguments are admitted as host Bools, as leaf results are; the
@@ -117,7 +122,7 @@ end
 
 # Handlers are dropped: nothing throws in the compiled program, and an exception
 # while tracing aborts the compile. The normal path keeps its `finally` copy.
-function strip_exception_handling!(ir::CC.IRCode)
+function strip_exception_handling!(ir::CC.IRCode, world::UInt)
     found = false
     for i in 1:length(ir.stmts)
         stmt = ir.stmts[i][:stmt]
@@ -131,19 +136,19 @@ function strip_exception_handling!(ir::CC.IRCode)
         end
     end
     found || return ir
-    return fold_trivial_phis!(decide_literal_branches!(CC.compact!(ir, true)))
+    return fold_trivial_phis!(decide_literal_branches!(CC.compact!(ir, true), world))
 end
 
 # Julia 1.11 lowers `finally` to one body dispatching on a state value; with the
 # handler gone the rethrow branch compares two literals, and left undecided it
 # would become a throwing exit carried out of an enclosing loop.
-function decide_literal_branches!(ir::CC.IRCode)
+function decide_literal_branches!(ir::CC.IRCode, world::UInt)
     decided = false
     for (b, block) in enumerate(ir.cfg.blocks)
         i = last(block.stmts)
         t = ir.stmts[i][:stmt]
         t isa Core.GotoIfNot || continue
-        taken = literal_condition(ir, t.cond)
+        taken = literal_condition(ir, t.cond, world)
         taken === nothing && continue
         if taken
             setstmt!(ir, i, nothing)
@@ -157,11 +162,11 @@ function decide_literal_branches!(ir::CC.IRCode)
     return decided ? CC.compact!(ir, true) : ir
 end
 
-function literal_condition(ir::CC.IRCode, @nospecialize(cond))
+function literal_condition(ir::CC.IRCode, @nospecialize(cond), world::UInt)
     cond isa Bool && return cond
     cond isa Core.SSAValue || return nothing
     stmt = ir.stmts[cond.id][:stmt]
-    is_call(stmt, ===, 2) || return nothing
+    is_call(stmt, ===, 2, world) || return nothing
     a, b = literal(stmt.args[2]), literal(stmt.args[3])
     (a === nothing || b === nothing) && return nothing
     return a[] === b[]
@@ -224,17 +229,14 @@ end
 # bound. Later releases hoist such reads (maleadt/IRStructurizer.jl#62).
 const STRUCTURIZER_HOISTS = pkgversion(IRStructurizer) > v"0.6.4"
 
-function dedup_getfield!(ir::CC.IRCode)
+function dedup_getfield!(ir::CC.IRCode, world::UInt)
     domtree = CC.construct_domtree(ir.cfg.blocks)
     seen = Dict{Any,Tuple{Int,Int}}()
     rename = Dict{Int,Int}()
     for i in 1:length(ir.stmts)
         stmt = ir.stmts[i][:stmt]
         stmt isa Expr && stmt.head === :call && length(stmt.args) == 3 || continue
-        f = stmt.args[1]
-        f isa GlobalRef &&
-            (f = isdefined(f.mod, f.name) ? getglobal(f.mod, f.name) : nothing)
-        f === Core.getfield || continue
+        resolves(stmt.args[1], Core.getfield, world) || continue
         object, field = stmt.args[2], stmt.args[3]
         object isa Union{Core.SSAValue,Core.Argument} || continue
         field isa QuoteNode && (field = field.value)

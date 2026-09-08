@@ -82,6 +82,16 @@ a traced number stands in for its element type: intrinsics on it map to the
 `Base` operation Julia's own method computes, and objects whose type inference
 specialized on the host type are rebuilt through their constructor.
 
+Inferred source and prepared interpreter operands are cached on Julia's
+`CodeInstance`s through CompilerCaching.jl. Unrelated method definitions reuse
+those results; changes to a method or its dependencies invalidate them. Dispatch
+is checked again after a world change so a new, more specific overload is honored.
+Each active call owns its execution buffers. The compiler infrastructure runs
+in the world captured when the package loads, preserving its precompiled native
+code across later package loads. User method lookup and global reads use the
+user program's world. Developers changing these compiler routines should restart
+Julia to refresh the captured world.
+
 ## Scope
 
 Supported: `if`/`elseif`/`else`, `&&` and `||`, `return` from inside a branch,
@@ -128,8 +138,8 @@ Reactant's own test files unchanged, `test/core/control_flow.jl` by default or
 does not.
 
 Requires Julia 1.11, 1.12 or 1.13. The compiler interfaces that changed in
-1.12 (`Future`s, `MethodCallResult`, the inlining hook, where the valid worlds
-of an inference result live) are gated in `interpreter.jl` and `code.jl`; 1.13
-needs nothing further. Julia 1.11 also lowers `finally` to one shared body that dispatches on a state value;
+1.12 (`Future`s, `MethodCallResult`, and the inlining hook) are gated in
+`interpreter.jl`; CompilerCaching handles version differences in the inferred
+source cache. Julia 1.11 also lowers `finally` to one shared body that dispatches on a state value;
 once the handler is dropped that dispatch compares two literals and is decided
 before structurization, so its dead `rethrow` never becomes a loop exit.

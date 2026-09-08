@@ -37,6 +37,7 @@ using PrecompileTools: @setup_workload, @compile_workload
             end
         end
     end
-    # Resolutions are valid for worlds of this process only.
+    # Dispatch lookups contain this process's world numbers. CodeInstances and
+    # their prepared results are serialized with Julia's dependency tracking.
     empty!(RESOLUTIONS)
 end
