@@ -7,9 +7,13 @@ struct Code
     # Memoized per control-flow op: does it return, does it leave the loop.
     returns::IdDict{Any,Bool}
     exits::IdDict{Any,Bool}
+    blocks::IdDict{Block,PreparedBlock}
 end
 function Code(sci, method, sparams, valid_worlds)
-    return Code(sci, method, sparams, valid_worlds, IdDict(), IdDict())
+    returns, exits = IdDict{Any,Bool}(), IdDict{Any,Bool}()
+    return Code(
+        sci, method, sparams, valid_worlds, returns, exits, prepare(sci, returns, exits)
+    )
 end
 
 # What a call signature dispatches to. `code === nothing` marks a leaf.

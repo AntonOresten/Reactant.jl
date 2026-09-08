@@ -200,13 +200,14 @@ function emit_loop(fr::Frame, op::ForOp)
     if lower isa Integer && upper isa Integer && step isa Integer
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
         unrolled = Unrolled(fr)
+        body_frame = fork(fr; exits=false)
         while lower < upper && (
             unassigned(carries) ||
             !tuple_any(has_traced, carries) ||
             !tuple_all(rollable, carries)
         )
             bind!(fr, op.iv_arg, lower)
-            carries = iteration(fr, op.body, carries)
+            carries = iteration(fr, op.body, carries, body_frame)
             lower += step
             count!(unrolled)
         end
@@ -239,6 +240,7 @@ function emit_loop(fr::Frame, op::WhileOp)
     has_return(fr, op) && unsupported(fr, "`return` inside a loop")
     carries = operands(fr, op.init_values)
     unrolled = Unrolled(fr)
+    body_frame = fork(fr; exits=false)
     while true
         bind!(fr, op.before.args, carries)
         outcome = emit_block(fr, op.before)
@@ -247,7 +249,7 @@ function emit_loop(fr::Frame, op::WhileOp)
         (!tuple_any(has_traced, outcome.values) || !tuple_all(rollable, outcome.values)) ||
             break
         outcome.condition || return outcome.values
-        carries = iteration(fr, op.after, outcome.values)
+        carries = iteration(fr, op.after, outcome.values, body_frame)
         count!(unrolled)
     end
     unassigned(carries) &&
@@ -282,9 +284,9 @@ function count!(u::Unrolled)
     return nothing
 end
 
-function iteration(fr::Frame, body::Block, @nospecialize(carries::Tuple))
+function iteration(fr::Frame, body::Block, @nospecialize(carries::Tuple), child::Frame)
     bind!(fr, body.args, carries)
-    outcome = emit_block(fork(fr; exits=false), body)
+    outcome = emit_block(reset_frame!(child, fr; exits=false), body)
     outcome isa Yielded || unsupported(fr, "a loop body that does not continue")
     return outcome.values
 end
@@ -297,9 +299,10 @@ function emit_loop(fr::Frame, op::LoopOp)
     k != 0 && carries[k] isa Iteration && return roll_counted(fr, op, k, carries)
     host = iterates_host_collection(fr, op)
     unrolled = Unrolled(fr)
+    body_frame = fork(fr; exits=true)
     local done
     while true
-        done, carries... = iteration_of_general_loop(fr, op.body, carries)
+        done, carries... = iteration_of_general_loop(fr, op.body, carries, body_frame)
         done isa Bool || break
         done && return carries
         !host && tuple_any(has_traced, carries) && tuple_all(rollable, carries) && break
@@ -309,9 +312,11 @@ function emit_loop(fr::Frame, op::LoopOp)
     return roll(fr, op, (carry(fr, done), tuple_map(v -> carry(fr, v), carries)...))
 end
 
-function iteration_of_general_loop(fr::Frame, body::Block, @nospecialize(carries::Tuple))
+function iteration_of_general_loop(
+    fr::Frame, body::Block, @nospecialize(carries::Tuple), child::Frame=fork(fr; exits=true)
+)
     bind!(fr, body.args, carries)
-    outcome = emit_block(fork(fr; exits=true), body)
+    outcome = emit_block(reset_frame!(child, fr; exits=true), body)
     outcome isa Yielded ||
         unsupported(fr, "a general loop body that neither continues nor breaks")
     return outcome.values
@@ -612,14 +617,15 @@ function continued(fr::Frame, op::LoopOp, @nospecialize(carries::Tuple))
     for position in 1:(length(body.stmts) - 1)
         idx = body.ssa_idxes[position]
         fr.pc = idx
-        fr.ssa[idx] = emit_stmt(fr, body.stmts[position])
+        fr.ssa[idx] = emit_stmt(fr, fr.code.blocks[op.body].statements[position])
     end
-    return operands(fr, last(body.stmts).then_region.terminator.values)
+    yielded = fr.code.blocks[last(body.stmts).then_region].terminator
+    return Tuple(operands!(fr, yielded.operands))
 end
 
 # iterating a traced range
 
-function iterates_traced_range(@nospecialize(args::Tuple))
+function iterates_traced_range(args::Vector{Any})
     length(args) in (1, 2) || return false
     args[1] isa Reactant.TracedUnitRange || return false
     return length(args) == 1 || args[2] isa Iteration
