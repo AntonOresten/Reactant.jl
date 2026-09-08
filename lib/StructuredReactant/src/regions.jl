@@ -106,7 +106,7 @@ function Reactant.call_with_reactant(r::Region, values...)
     bind!(fr, r.keys, values)
     outcome = emit_block(fr, r.block, 1, r.continuation)
     result = if outcome isa Yielded
-        map(regionvalue, outcome.values)
+        tuple_map(regionvalue, outcome.values)
     elseif outcome isa Returned
         (regionvalue(outcome.value),)   # the builder expects a tuple
     else
@@ -200,8 +200,11 @@ function emit_loop(fr::Frame, op::ForOp)
     if lower isa Integer && upper isa Integer && step isa Integer
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
         unrolled = Unrolled(fr)
-        while lower < upper &&
-              (unassigned(carries) || !any(has_traced, carries) || !all(rollable, carries))
+        while lower < upper && (
+            unassigned(carries) ||
+            !tuple_any(has_traced, carries) ||
+            !tuple_all(rollable, carries)
+        )
             bind!(fr, op.iv_arg, lower)
             carries = iteration(fr, op.body, carries)
             lower += step
@@ -211,7 +214,7 @@ function emit_loop(fr::Frame, op::ForOp)
     end
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
-    return roll_for(fr, op, lower, upper, step, map(v -> carry(fr, v), carries))
+    return roll_for(fr, op, lower, upper, step, tuple_map(v -> carry(fr, v), carries))
 end
 
 # Rolled as `@trace for` emits it: a zero-based counter compared against the
@@ -241,17 +244,20 @@ function emit_loop(fr::Frame, op::WhileOp)
         outcome = emit_block(fr, op.before)
         outcome isa Conditioned || unsupported(fr, "a loop condition that does not yield")
         outcome.condition isa Bool &&
-        (!any(has_traced, outcome.values) || !all(rollable, outcome.values)) || break
+        (!tuple_any(has_traced, outcome.values) || !tuple_all(rollable, outcome.values)) ||
+            break
         outcome.condition || return outcome.values
         carries = iteration(fr, op.after, outcome.values)
         count!(unrolled)
     end
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
-    return roll(fr, op, map(v -> carry(fr, v), carries))
+    return roll(fr, op, tuple_map(v -> carry(fr, v), carries))
 end
 
-unassigned(@nospecialize(carries::Tuple)) = any(v -> v isa MissingTracedValue, carries)
+function unassigned(@nospecialize(carries::Tuple))
+    return tuple_any(v -> v isa MissingTracedValue, carries)
+end
 
 # Past this many emitting host iterations, say once how to roll the loop.
 const UNROLL_WARNING = Ref(256)
@@ -296,11 +302,11 @@ function emit_loop(fr::Frame, op::LoopOp)
         done, carries... = iteration_of_general_loop(fr, op.body, carries)
         done isa Bool || break
         done && return carries
-        !host && any(has_traced, carries) && all(rollable, carries) && break
+        !host && tuple_any(has_traced, carries) && tuple_all(rollable, carries) && break
         count!(unrolled)
     end
     # The last decision may already be traced: the rolled loop starts from it.
-    return roll(fr, op, (carry(fr, done), map(v -> carry(fr, v), carries)...))
+    return roll(fr, op, (carry(fr, done), tuple_map(v -> carry(fr, v), carries)...))
 end
 
 function iteration_of_general_loop(fr::Frame, body::Block, @nospecialize(carries::Tuple))
@@ -381,7 +387,10 @@ function carry(::Frame, x::TracedRArray{T,N}) where {T,N}
 end
 carry(::Frame, x::TracedRNumber{T}) where {T} = TracedRNumber{T}((), x.mlir_data)
 carry(::Frame, x::Number) = Ops.constant(x)
-carry(fr::Frame, x::Union{Tuple,NamedTuple}) = map(v -> carry(fr, v), x)
+carry(fr::Frame, @nospecialize(x::Tuple)) = tuple_map(v -> carry(fr, v), x)
+function carry(fr::Frame, @nospecialize(x::NamedTuple))
+    return NamedTuple{fieldnames(typeof(x))}(tuple_map(v -> carry(fr, v), x))
+end
 carry(fr::Frame, x::Iteration) = Iteration(carry(fr, x.i), carry(fr, x.stop))
 function carry(fr::Frame, x::MissingTracedValue)
     return unsupported(fr, "reading a value after a loop that is only assigned inside it")
@@ -424,16 +433,21 @@ function rollable(@nospecialize(x))
     ismutable(x) && return false
     T = typeof(x)
     isstructtype(T) || return true
-    return all(i -> isdefined(x, i) && rollable(getfield(x, i)), 1:fieldcount(T))
+    for i in 1:fieldcount(T)   # not `all(closure, ...)`: a closure over `x` has a type per T
+        isdefined(x, i) && rollable(getfield(x, i)) || return false
+    end
+    return true
 end
-rollable(x::Union{Tuple,NamedTuple}) = all(rollable, x)
+rollable(@nospecialize(x::Union{Tuple,NamedTuple})) = tuple_all(rollable, x)
 rollable(::MissingTracedValue) = false
 
-function update!(fr::Frame, carries::Union{Tuple,NamedTuple}, next)
-    length(carries) == length(next) ||
+function update!(
+    fr::Frame, @nospecialize(carries::Union{Tuple,NamedTuple}), @nospecialize(next)
+)
+    next isa Union{Tuple,NamedTuple} && nfields(carries) == nfields(next) ||
         unsupported(fr, "a loop that changes how many values it carries")
-    for (c, n) in zip(carries, next)
-        update!(fr, c, n)
+    for i in 1:nfields(carries)
+        update!(fr, getfield(carries, i), getfield(next, i))
     end
     return nothing
 end
@@ -522,15 +536,17 @@ function indexed_by_state(@nospecialize(x))
     x isa Union{AbstractArray,Tuple,NamedTuple,AbstractDict,AbstractSet} && return true
     T = typeof(x)
     isstructtype(T) && !ismutable(x) || return false
-    return any(1:fieldcount(T)) do i
-        isdefined(x, i) || return false
+    for i in 1:fieldcount(T)
+        isdefined(x, i) || continue
         f = getfield(x, i)
-        return if f isa Union{Tuple,NamedTuple}
-            any(indexed_by_state, f)
+        indexed = if f isa Union{Tuple,NamedTuple}
+            tuple_any(indexed_by_state, f)
         else
             indexed_by_state(f)
         end
+        indexed && return true
     end
+    return false
 end
 
 # The `iterate` result behind an exit test `not_int(next === nothing)`.
@@ -569,7 +585,7 @@ function roll_counted(fr::Frame, op::LoopOp, k::Int, @nospecialize(carries::Tupl
     carries = continued(fr, op, carries)
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
-    carries = map(v -> carry(fr, v), carries)
+    carries = tuple_map(v -> carry(fr, v), carries)
     it = carries[k]::Iteration
     T = unwrapped(it.i)
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))

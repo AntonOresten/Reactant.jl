@@ -85,6 +85,29 @@ function operands(fr::Frame, xs)
     return Tuple(values)
 end
 
+# Tuple traversals that do not specialize on the tuple's type: the emitter meets
+# one argument tuple type per call site of the program, and `any(f, t)` or
+# `map(f, t)` would have Julia compile once for each of them.
+function tuple_any(f, @nospecialize(t::Union{Tuple,NamedTuple}))
+    for i in 1:nfields(t)
+        f(getfield(t, i)) && return true
+    end
+    return false
+end
+function tuple_all(f, @nospecialize(t::Union{Tuple,NamedTuple}))
+    for i in 1:nfields(t)
+        f(getfield(t, i)) || return false
+    end
+    return true
+end
+function tuple_map(f, @nospecialize(t::Union{Tuple,NamedTuple}))
+    values = Vector{Any}(undef, nfields(t))
+    for i in 1:nfields(t)
+        values[i] = f(getfield(t, i))
+    end
+    return Tuple(values)
+end
+
 bind!(fr::Frame, x::Core.SSAValue, @nospecialize(v)) = (fr.ssa[x.id] = v)
 bind!(fr::Frame, x::Core.Argument, @nospecialize(v)) = (fr.arguments[x.n] = v)
 bind!(fr::Frame, x::BlockArgument, @nospecialize(v)) = (fr.blockargs[x.id] = v)
@@ -116,7 +139,10 @@ function has_traced(@nospecialize(x), seen::Base.IdSet{Any}=Base.IdSet{Any}())
     isprimitivetype(T) && return false
     if x isa Array   # other array types (wrappers, ranges) are searched by field
         isbitstype(eltype(x)) && return false
-        return any(i -> isassigned(x, i) && has_traced(x[i], seen), eachindex(x))
+        for i in eachindex(x)
+            isassigned(x, i) && has_traced(x[i], seen) && return true
+        end
+        return false
     end
     if ismutabletype(T)
         x in seen && return false
@@ -289,7 +315,7 @@ end
 # was given, so the object is rebuilt through its constructor.
 function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
     T isa DataType || unsupported(fr, "constructing a value of type $(T)")
-    if all(i -> fields[i] isa fieldtype(T, i), eachindex(fields))
+    if fields_match(T, fields)
         return ccall(
             :jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields)
         )
@@ -310,6 +336,14 @@ function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
     return wrapper(fields...)
 end
 
+# A loop, not `all(closure, ...)`: a closure over `T` would have a type per `T`.
+function fields_match(@nospecialize(T::DataType), fields::Vector{Any})
+    for i in eachindex(fields)
+        fields[i] isa fieldtype(T, i) || return false
+    end
+    return true
+end
+
 function reparameterize(T::DataType, fields::Vector{Any})
     body = Base.unwrap_unionall(T.name.wrapper)
     params = Any[T.parameters...]
@@ -328,7 +362,7 @@ function emit_call(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
         return emit_intrinsic(fr, f, args)
     elseif f isa Core.Builtin
         return emit_builtin(fr, f, args)
-    elseif has_traced(f) || any(has_traced, args)
+    elseif has_traced(f) || tuple_any(has_traced, args)
         return emit_method(f, args, fr)
     end
     return f(args...)
@@ -339,7 +373,7 @@ const EMISSIONS = Ref(0)
 
 function leaf(@nospecialize(f), @nospecialize(args::Tuple))
     EMISSIONS[] += 1
-    return Reactant.call_with_reactant(f, map(structure_callback, args)...)
+    return Reactant.call_with_reactant(f, tuple_map(structure_callback, args)...)
 end
 
 # Dispatch on the runtime argument types: a leaf is called through Reactant with
@@ -349,7 +383,7 @@ function emit_method(
 )
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
-    sig = Tuple{Core.Typeof(f),map(Core.Typeof, args)...}
+    sig = Tuple{Core.Typeof(f),tuple_map(Core.Typeof, args)...}
     resolution = resolve(sig, Base.get_world_counter())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
     code = resolution.code
@@ -393,13 +427,15 @@ function emit_builtin(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
         return Reactant.call_with_reactant(Base.ifelse, args...)
     elseif f === Core.getfield && length(args) >= 2 && args[1] isa Iteration
         return iteration_field(fr, args[1], args[2])
-    elseif f === Core.:(===) && length(args) == 2 && any(a -> a isa Iteration, args)
+    elseif f === Core.:(===) && length(args) == 2 && tuple_any(a -> a isa Iteration, args)
         return iteration_done(fr, args[1], args[2])
     elseif f === Core.typeassert && args[1] isa TracedRNumber
         # A traced number stands in for its element type.
         Reactant.unwrapped_eltype(args[1]) <: args[2] && return args[1]
-    elseif f === Core.:(===) && length(args) == 2 && any(a -> a isa TracedRNumber, args)
-        all(a -> a isa Number, args) && return identical(fr, args[1], args[2])
+    elseif f === Core.:(===) &&
+        length(args) == 2 &&
+        tuple_any(a -> a isa TracedRNumber, args)
+        tuple_all(a -> a isa Number, args) && return identical(fr, args[1], args[2])
     elseif f === Core.getfield && length(args) >= 2 && args[2] isa TracedRNumber
         unsupported(fr, "indexing a tuple or struct with a traced integer")
     end
