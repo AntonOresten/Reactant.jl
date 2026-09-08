@@ -4,6 +4,7 @@ authors = ["Anton Oresten"]
 version = "0.1.0"
 
 [deps]
+CompilerCaching = "9db33cc3-5358-4881-8759-fa4194144afd"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
@@ -14,6 +15,7 @@ Reactant = {path = "../.."}
 ReactantCore = {path = "../ReactantCore"}
 
 [compat]
+CompilerCaching = "0.5"
 IRStructurizer = "0.6"
 PrecompileTools = "1"
 Reactant = "0.2"

@@ -71,6 +71,8 @@ end
 CC.may_compress(::Interpreter) = false
 
 function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
+    # Julia 1.13 may supply a local optimization state before publishing source.
+    src isa CC.OptimizationState && (src = src.src)
     return any_call_match(leaf_match, info) ||
            opaque_to_emitter(src) ||
            (contains_loop(src) && any_call_match(host_match, info))
