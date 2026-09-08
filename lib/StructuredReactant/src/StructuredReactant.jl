@@ -27,6 +27,8 @@ public FrontendError
 
 include("interpreter.jl")
 
+include("prepare.jl")
+
 include("code.jl")
 
 include("program.jl")

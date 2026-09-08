@@ -21,13 +21,14 @@ mutable struct Frame
     const arguments::Vector{Any}   # Argument(n) => arguments[n]; arguments[1] is the callee
     const ssa::Vector{Any}         # SSAValue(id) => ssa[id]
     const blockargs::Vector{Any}   # BlockArgument(id) => blockargs[id]
+    const scratch::Vector{Any}     # call operands; never stored as an emitted value
     const parent::Union{Nothing,Frame}
     pc::Int                        # SSA index being emitted, for diagnostics
     exits::Bool                    # in a general loop body: continue/break yield (done, values...)
 end
 
 function Frame(
-    code::Code, @nospecialize(f), @nospecialize(args::Tuple), parent::Union{Nothing,Frame}
+    code::Code, @nospecialize(f), args::Vector{Any}, parent::Union{Nothing,Frame}
 )
     sci = code.sci
     return Frame(
@@ -35,6 +36,7 @@ function Frame(
         pack_arguments(code.method, f, args),
         Vector{Any}(undef, sci.max_ssa_idx),
         Vector{Any}(undef, sci.max_arg_idx),
+        Any[],
         parent,
         0,
         false,
@@ -47,17 +49,52 @@ function fork(fr::Frame; exits::Bool=fr.exits)
         copy(fr.arguments),
         copy(fr.ssa),
         copy(fr.blockargs),
+        Any[],
         fr.parent,
         fr.pc,
         exits,
     )
 end
 
+# A host loop reuses its child activation. Copy the slots, including undefined
+# ones, before each iteration; nested loops still have their own child frames.
+function reset_frame!(dest::Frame, source::Frame; exits::Bool=source.exits)
+    copyto!(dest.arguments, source.arguments)
+    copyto!(dest.ssa, source.ssa)
+    copyto!(dest.blockargs, source.blockargs)
+    empty!(dest.scratch)
+    dest.pc = source.pc
+    dest.exits = exits
+    return dest
+end
+
 # A vararg method receives its trailing arguments as one tuple.
-function pack_arguments(method::Method, @nospecialize(f), @nospecialize(args::Tuple))
+function pack_arguments(method::Method, @nospecialize(f), args::Vector{Any})
     method.isva || return Any[f, args...]
     fixed = Int(method.nargs) - 2
-    return Any[f, args[1:fixed]..., args[(fixed + 1):end]]
+    return Any[f, args[1:fixed]..., Tuple(@view args[(fixed + 1):end])]
+end
+
+@inline function operand(fr::Frame, x::PreparedOperand)
+    kind = x.kind
+    kind === SSA && return fr.ssa[x.index]
+    kind === ARGUMENT && return fr.arguments[x.index]
+    kind === BLOCK_ARGUMENT && return fr.blockargs[x.index]
+    if kind === GLOBAL
+        ref = x.value::GlobalRef
+        return getglobal(ref.mod, ref.name)
+    elseif kind === UNDEFINED
+        return operand(fr, x.value::Undef)
+    end
+    return x.value
+end
+
+function operands!(fr::Frame, xs::Vector{PreparedOperand})
+    values = resize!(fr.scratch, length(xs))
+    for i in eachindex(xs)
+        values[i] = operand(fr, xs[i])
+    end
+    return values
 end
 
 operand(::Frame, @nospecialize(x)) = x
@@ -112,12 +149,12 @@ bind!(fr::Frame, x::Core.SSAValue, @nospecialize(v)) = (fr.ssa[x.id] = v)
 bind!(fr::Frame, x::Core.Argument, @nospecialize(v)) = (fr.arguments[x.n] = v)
 bind!(fr::Frame, x::BlockArgument, @nospecialize(v)) = (fr.blockargs[x.id] = v)
 
-function bind!(fr::Frame, keys, values)
-    length(keys) == length(values) || unsupported(
-        fr, "a region receiving $(length(values)) values for $(length(keys)) arguments"
+function bind!(fr::Frame, keys::Vector, @nospecialize(values::Tuple))
+    length(keys) == nfields(values) || unsupported(
+        fr, "a region receiving $(nfields(values)) values for $(length(keys)) arguments"
     )
-    for (key, value) in zip(keys, values)
-        bind!(fr, key, uncapture(value))
+    for i in eachindex(keys)
+        bind!(fr, keys[i], uncapture(getfield(values, i)))
     end
     return fr
 end
@@ -194,34 +231,35 @@ function emit_block(
     fr::Frame, block::Block, from::Int=1, k::Union{Nothing,Continuation}=nothing
 )
     body = block.body
+    prepared = fr.code.blocks[block]
     for position in from:length(body.ssa_idxes)
         idx = body.ssa_idxes[position]
-        stmt = body.stmts[position]
+        stmt = prepared.statements[position]
         fr.pc = idx
-        if stmt isa IfOp && (has_return(fr, stmt) || (fr.exits && exits_loop(fr, stmt)))
-            return emit_if(fr, stmt, Continuation(block, position, k))
+        if stmt.returns || (fr.exits && stmt.exits)
+            return emit_if(fr, stmt.value.value::IfOp, Continuation(block, position, k))
         end
         fr.ssa[idx] = emit_stmt(fr, stmt)
     end
-    return emit_terminator(fr, block.terminator, k)
+    return emit_terminator(fr, prepared.terminator, k)
 end
 
-function emit_terminator(fr::Frame, t, k::Union{Nothing,Continuation})
-    if t isa Core.ReturnNode
-        isdefined(t, :val) || unsupported(fr, "code after a call that always throws")
-        return Returned(operand(fr, t.val))
-    elseif t isa YieldOp
-        values = operands(fr, t.values)
-        return k === nothing ? Yielded(values) : resume(k, fr, values)
-    elseif t isa ContinueOp
-        values = operands(fr, t.values)
-        fr.exits && return Yielded((false, values...))
-        return k === nothing ? Yielded(values) : resume(k, fr, values)
-    elseif t isa BreakOp
+function emit_terminator(fr::Frame, t::PreparedTerminator, k::Union{Nothing,Continuation})
+    kind = t.kind
+    if kind === RETURN
+        return Returned(operand(fr, t.value))
+    elseif kind === YIELD || kind === CONTINUE
+        values = operands!(fr, t.operands)
+        kind === CONTINUE && fr.exits && return Yielded((false, values...))
+        yielded = Tuple(values)
+        return k === nothing ? Yielded(yielded) : resume(k, fr, yielded)
+    elseif kind === BREAK
         fr.exits || unsupported(fr, "`break` outside a general loop")
-        return Yielded((true, operands(fr, t.values)...))
-    elseif t isa ConditionOp
-        return Conditioned(operand(fr, t.condition), operands(fr, t.args))
+        return Yielded((true, operands!(fr, t.operands)...))
+    elseif kind === CONDITION
+        return Conditioned(operand(fr, t.value), Tuple(operands!(fr, t.operands)))
+    elseif kind === UNREACHABLE
+        unsupported(fr, "code after a call that always throws")
     end
     return unsupported(fr, "a block without a terminator")
 end
@@ -282,16 +320,19 @@ const SILENT_EXPRESSIONS = (
     :popaliasscope,
 )
 
+function emit_stmt(fr::Frame, stmt::PreparedStatement)
+    kind = stmt.kind
+    kind === VALUE && return operand(fr, stmt.value)
+    kind === CALL &&
+        return emit_call(fr, operand(fr, stmt.value), operands!(fr, stmt.operands))
+    kind === NEW &&
+        return construct(fr, operand(fr, stmt.value), operands!(fr, stmt.operands))
+    return emit_stmt(fr, stmt.value.value)
+end
+
 function emit_stmt(fr::Frame, ex::Expr)
     head = ex.head
-    if head === :call
-        return emit_call(fr, operand(fr, ex.args[1]), operands(fr, @view ex.args[2:end]))
-    elseif head === :invoke
-        return emit_call(fr, operand(fr, ex.args[2]), operands(fr, @view ex.args[3:end]))
-    elseif head === :new
-        fields = Any[operand(fr, a) for a in @view ex.args[2:end]]
-        return construct(fr, operand(fr, ex.args[1]), fields)
-    elseif head === :splatnew
+    if head === :splatnew
         fields = Any[operand(fr, ex.args[2])...]
         return construct(fr, operand(fr, ex.args[1]), fields)
     elseif head === :static_parameter
@@ -357,23 +398,33 @@ function reparameterize(T::DataType, fields::Vector{Any})
 end
 
 # Builtins and calls without traced arguments run in Julia.
-function emit_call(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
+function emit_call(fr::Frame, @nospecialize(f), args::Vector{Any})
     if f isa Core.IntrinsicFunction   # intrinsics are builtins too; test them first
         return emit_intrinsic(fr, f, args)
     elseif f isa Core.Builtin
         return emit_builtin(fr, f, args)
-    elseif has_traced(f) || tuple_any(has_traced, args)
+    elseif has_traced(f) || any(has_traced, args)
         return emit_method(f, args, fr)
     end
     return f(args...)
 end
 
+# Keep the result element type fixed. `map` widens a vector from its first
+# result, compiling collection helpers for the program's argument types.
+function map_arguments(f, args::Vector{Any})
+    values = Vector{Any}(undef, length(args))
+    for i in eachindex(args)
+        values[i] = f(args[i])
+    end
+    return values
+end
+
 # Counting leaf calls tells emitting loop iterations from host ones.
 const EMISSIONS = Ref(0)
 
-function leaf(@nospecialize(f), @nospecialize(args::Tuple))
+function leaf(@nospecialize(f), args::Vector{Any})
     EMISSIONS[] += 1
-    return Reactant.call_with_reactant(f, tuple_map(structure_callback, args)...)
+    return Reactant.call_with_reactant(f, map_arguments(structure_callback, args)...)
 end
 
 # Dispatch on the runtime argument types: a leaf is called through Reactant with
@@ -381,9 +432,12 @@ end
 function emit_method(
     @nospecialize(f), @nospecialize(args::Tuple), parent::Union{Nothing,Frame}
 )
+    return emit_method(f, Any[args...], parent)
+end
+function emit_method(@nospecialize(f), args::Vector{Any}, parent::Union{Nothing,Frame})
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
-    sig = Tuple{Core.Typeof(f),tuple_map(Core.Typeof, args)...}
+    sig = Tuple{Core.Typeof(f),map_arguments(Core.Typeof, args)...}
     resolution = resolve(sig, Base.get_world_counter())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
     code = resolution.code
@@ -416,30 +470,40 @@ function structure_callback(@nospecialize(x))
     return structured(x)
 end
 
-function emit_builtin(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
+# Most builtin calls have a small, fixed arity. Passing the values directly
+# avoids the argument packing of `_apply_iterate` on every interpreted call.
+@inline function apply_builtin(f::Core.Builtin, args::Vector{Any})
+    n = length(args)
+    n == 0 && return f()
+    n == 1 && return f(args[1])
+    n == 2 && return f(args[1], args[2])
+    n == 3 && return f(args[1], args[2], args[3])
+    n == 4 && return f(args[1], args[2], args[3], args[4])
+    return f(args...)
+end
+
+function emit_builtin(fr::Frame, @nospecialize(f), args::Vector{Any})
     if f === Core._apply_iterate
         flat = Any[]
-        for iterable in args[3:end]
-            splat!(fr, flat, iterable)
+        for i in 3:length(args)
+            splat!(fr, flat, args[i])
         end
-        return emit_call(fr, args[2], Tuple(flat))
+        return emit_call(fr, args[2], flat)
     elseif f === Core.ifelse && args[1] isa TracedRNumber{Bool}
         return Reactant.call_with_reactant(Base.ifelse, args...)
     elseif f === Core.getfield && length(args) >= 2 && args[1] isa Iteration
         return iteration_field(fr, args[1], args[2])
-    elseif f === Core.:(===) && length(args) == 2 && tuple_any(a -> a isa Iteration, args)
+    elseif f === Core.:(===) && length(args) == 2 && any(a -> a isa Iteration, args)
         return iteration_done(fr, args[1], args[2])
     elseif f === Core.typeassert && args[1] isa TracedRNumber
         # A traced number stands in for its element type.
         Reactant.unwrapped_eltype(args[1]) <: args[2] && return args[1]
-    elseif f === Core.:(===) &&
-        length(args) == 2 &&
-        tuple_any(a -> a isa TracedRNumber, args)
-        tuple_all(a -> a isa Number, args) && return identical(fr, args[1], args[2])
+    elseif f === Core.:(===) && length(args) == 2 && any(a -> a isa TracedRNumber, args)
+        all(a -> a isa Number, args) && return identical(fr, args[1], args[2])
     elseif f === Core.getfield && length(args) >= 2 && args[2] isa TracedRNumber
         unsupported(fr, "indexing a tuple or struct with a traced integer")
     end
-    return f(args...)
+    return apply_builtin(f, args)
 end
 
 # Structurization synthesizes `===` on integer discriminators, which turn traced

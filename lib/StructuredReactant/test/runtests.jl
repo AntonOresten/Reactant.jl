@@ -44,6 +44,12 @@ struct Tally{V}
 end
 const y = Float32[-1, -2]
 
+module PreparedGlobals
+gain = 1.0f0
+apply(x) = x .* gain
+set_gain!(value) = (global gain = value)
+end
+
 @testset "StructuredReactant" begin
     @testset "branches" begin
         helper(x) = sum(x) > 0.0f0 ? x + x : x - x
@@ -498,6 +504,17 @@ const y = Float32[-1, -2]
         varargs(x, ys...) = sum(x) > 0.0f0 ? x + ys[1] : x - ys[end]
         @test agrees(varargs, (x, y, x), (y, y, x))
 
+        # Calls of different arities and nested activations must not overwrite
+        # tuples returned by earlier calls through the same scratch buffer.
+        Base.@noinline saved_args(xs...) = xs
+        no_args() = 4.0f0
+        function retained_args(x)
+            saved = saved_args(x, 2.0f0, 3.0f0)
+            next = saved_args(noinline_helper(x))
+            return saved, saved_args(next..., no_args(), saved...)
+        end
+        @test agrees(retained_args, (x,), (y,))
+
         keywords(x; scale=2.0f0) = sum(x) > 0.0f0 ? x .* scale : x ./ scale
         @test agrees(keywords, (x,), (y,); scale=3.0f0)
 
@@ -839,6 +856,18 @@ const y = Float32[-1, -2]
         after = Base.invokelatest(() -> Reactant.@compile structured(uses_redefined)(R(x)))
         @test host(before(R(x))) ≈ x .+ 1.0f0
         @test host(after(R(x))) ≈ x .+ 2.0f0
+    end
+
+    @testset "non-constant globals" begin
+        try
+            before = Reactant.@compile structured(PreparedGlobals.apply)(R(x))
+            PreparedGlobals.set_gain!(3.0f0)
+            after = Reactant.@compile structured(PreparedGlobals.apply)(R(x))
+            @test host(before(R(x))) ≈ x
+            @test host(after(R(x))) ≈ x .* 3.0f0
+        finally
+            PreparedGlobals.set_gain!(1.0f0)
+        end
     end
 
     @testset "diagnostics" begin
