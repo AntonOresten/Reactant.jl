@@ -2,7 +2,7 @@
 # traced after inference (loop carries, traced branches); map them to `Base`.
 
 function emit_intrinsic(fr::Frame, f::Core.IntrinsicFunction, args::Tuple)
-    any(a -> a isa TracedRNumber, args) || return f(args...)
+    tuple_any(a -> a isa TracedRNumber, args) || return f(args...)
     op = get(TRACED_INTRINSICS, f, nothing)
     op === nothing && unsupported(fr, "the `$(f)` intrinsic on traced operands")
     return op(args...)
@@ -14,7 +14,7 @@ bitwise_not(x) = Reactant.unwrapped_eltype(x) === Bool ? traced(!)(x) : traced(~
 
 function unsigned_only(op)
     return function (args...)
-        all(x -> Reactant.unwrapped_eltype(x) <: Unsigned, args) || throw(
+        tuple_all(x -> Reactant.unwrapped_eltype(x) <: Unsigned, args) || throw(
             FrontendError("unsigned `$(op)` on signed traced integers is not supported")
         )
         return Reactant.call_with_reactant(op, args...)

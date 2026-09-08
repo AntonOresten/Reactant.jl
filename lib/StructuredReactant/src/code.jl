@@ -18,7 +18,9 @@ struct Resolution
     valid_worlds::CC.WorldRange
 end
 
-const RESOLUTIONS = Dict{Type,Resolution}()
+# An `IdDict`: its methods do not specialize on the key, a `Dict{Type,...}`'s do,
+# once per signature.
+const RESOLUTIONS = IdDict{Any,Resolution}()
 const RESOLUTIONS_LOCK = ReentrantLock()
 
 function covers(r::Resolution, world::UInt)
