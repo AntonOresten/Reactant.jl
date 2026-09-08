@@ -121,7 +121,9 @@ end
 
 # A multiplexed exit leaves `undef` in slots a path does not define; one Reactant
 # cannot type (undefined in both branches) is replaced by a slot of the same type.
-function fill_dead_slots(values::Tuple, other::Tuple, @nospecialize(T))
+function fill_dead_slots(
+    @nospecialize(values::Tuple), @nospecialize(other::Tuple), @nospecialize(T)
+)
     T isa DataType && T <: Tuple && length(T.parameters) == length(values) || return values
     missing(k) = values[k] isa MissingTracedValue && other[k] isa MissingTracedValue
     any(missing, eachindex(values)) || return values
@@ -192,13 +194,14 @@ struct LoopBody end
 # the first traced one on, the remainder is a `stablehlo.while`. The first host
 # iteration also supplies a carry whose dead initializer Julia dropped.
 function emit_loop(fr::Frame, op::ForOp)
-    has_return(op) && unsupported(fr, "`return` inside a loop")
+    has_return(fr, op) && unsupported(fr, "`return` inside a loop")
     carries = operands(fr, op.init_values)
     lower, upper, step = operand(fr, op.lower), operand(fr, op.upper), operand(fr, op.step)
     if lower isa Integer && upper isa Integer && step isa Integer
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
         unrolled = Unrolled(fr)
-        while lower < upper && (unassigned(carries) || !any(has_traced, carries))
+        while lower < upper &&
+              (unassigned(carries) || !any(has_traced, carries) || !all(rollable, carries))
             bind!(fr, op.iv_arg, lower)
             carries = iteration(fr, op.body, carries)
             lower += step
@@ -213,7 +216,7 @@ end
 
 # Rolled as `@trace for` emits it: a zero-based counter compared against the
 # iteration count, which Enzyme's reverse pass recognizes and indexes caches by.
-function roll_for(fr::Frame, op::ForOp, lower, upper, step, carries::Tuple)
+function roll_for(fr::Frame, op::ForOp, lower, upper, step, @nospecialize(carries::Tuple))
     T = lower isa Number ? typeof(lower) : Reactant.unwrapped_eltype(lower)
     count = traced(÷)(traced(-)(traced(+)(upper, step), lower + one(T)), step)
     keys, invariants = traced_captures(fr, captures(op, Any[op.step], nothing))
@@ -230,14 +233,15 @@ function roll_for(fr::Frame, op::ForOp, lower, upper, step, carries::Tuple)
 end
 
 function emit_loop(fr::Frame, op::WhileOp)
-    has_return(op) && unsupported(fr, "`return` inside a loop")
+    has_return(fr, op) && unsupported(fr, "`return` inside a loop")
     carries = operands(fr, op.init_values)
     unrolled = Unrolled(fr)
     while true
         bind!(fr, op.before.args, carries)
         outcome = emit_block(fr, op.before)
         outcome isa Conditioned || unsupported(fr, "a loop condition that does not yield")
-        outcome.condition isa Bool && !any(has_traced, outcome.values) || break
+        outcome.condition isa Bool &&
+        (!any(has_traced, outcome.values) || !all(rollable, outcome.values)) || break
         outcome.condition || return outcome.values
         carries = iteration(fr, op.after, outcome.values)
         count!(unrolled)
@@ -247,7 +251,7 @@ function emit_loop(fr::Frame, op::WhileOp)
     return roll(fr, op, map(v -> carry(fr, v), carries))
 end
 
-unassigned(carries::Tuple) = any(v -> v isa MissingTracedValue, carries)
+unassigned(@nospecialize(carries::Tuple)) = any(v -> v isa MissingTracedValue, carries)
 
 # Past this many emitting host iterations, say once how to roll the loop.
 const UNROLL_WARNING = Ref(256)
@@ -272,7 +276,7 @@ function count!(u::Unrolled)
     return nothing
 end
 
-function iteration(fr::Frame, body::Block, carries::Tuple)
+function iteration(fr::Frame, body::Block, @nospecialize(carries::Tuple))
     bind!(fr, body.args, carries)
     outcome = emit_block(fork(fr; exits=false), body)
     outcome isa Yielded || unsupported(fr, "a loop body that does not continue")
@@ -283,22 +287,23 @@ end
 # rolled, its first carry is the `done` flag.
 function emit_loop(fr::Frame, op::LoopOp)
     carries = operands(fr, op.init_values)
-    k = counted_range(op)
+    k = counted_range(fr, op)
     k != 0 && carries[k] isa Iteration && return roll_counted(fr, op, k, carries)
+    host = iterates_host_collection(fr, op)
     unrolled = Unrolled(fr)
     local done
     while true
         done, carries... = iteration_of_general_loop(fr, op.body, carries)
         done isa Bool || break
         done && return carries
-        any(has_traced, carries) && break
+        !host && any(has_traced, carries) && all(rollable, carries) && break
         count!(unrolled)
     end
     # The last decision may already be traced: the rolled loop starts from it.
     return roll(fr, op, (carry(fr, done), map(v -> carry(fr, v), carries)...))
 end
 
-function iteration_of_general_loop(fr::Frame, body::Block, carries::Tuple)
+function iteration_of_general_loop(fr::Frame, body::Block, @nospecialize(carries::Tuple))
     bind!(fr, body.args, carries)
     outcome = emit_block(fork(fr; exits=true), body)
     outcome isa Yielded ||
@@ -307,7 +312,7 @@ function iteration_of_general_loop(fr::Frame, body::Block, carries::Tuple)
 end
 
 # The `stablehlo.while` for the remaining iterations.
-function roll(fr::Frame, op::Union{WhileOp,LoopOp}, carries::Tuple)
+function roll(fr::Frame, op::Union{WhileOp,LoopOp}, @nospecialize(carries::Tuple))
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, 0, 0) begin
         Ops.while_loop(
@@ -381,7 +386,48 @@ carry(fr::Frame, x::Iteration) = Iteration(carry(fr, x.i), carry(fr, x.stop))
 function carry(fr::Frame, x::MissingTracedValue)
     return unsupported(fr, "reading a value after a loop that is only assigned inside it")
 end
-carry(fr::Frame, x) = unsupported(fr, "a loop-carried value of type $(typeof(x))")
+# Any other immutable value is carried field by field, like a tuple (a decoder's
+# cache, say), and rebuilt through its constructor. A host number field becomes
+# a traced constant when the field's declared type admits one (a type parameter
+# or an abstract type); whatever else a field holds, a concretely typed number or
+# a symbol, is kept as it is and must stay the same on every iteration.
+function carry(fr::Frame, @nospecialize(x))
+    T = typeof(x)
+    ismutable(x) && return unsupported(fr, "a loop-carried value of type $(T)")
+    isstructtype(T) && fieldcount(T) > 0 || return x
+    fields = Any[carry_field(fr, T, i, x) for i in 1:fieldcount(T)]
+    return construct(fr, T, fields)
+end
+function carry_field(fr::Frame, T::DataType, i::Int, @nospecialize(x))
+    isdefined(x, i) ||
+        return unsupported(fr, "a loop-carried value with an undefined field")
+    v = getfield(x, i)
+    v isa Number && !admits_traced(T, i, v) && return v
+    return carry(fr, v)
+end
+function admits_traced(T::DataType, i::Int, @nospecialize(x::Number))
+    ft = fieldtype(Base.unwrap_unionall(T.name.wrapper), i)
+    ft isa TypeVar && return true
+    return try
+        TracedRNumber{typeof(x)} <: ft
+    catch
+        false
+    end
+end
+
+# Whether `carry` accepts `x`. A loop whose condition is still a host value keeps
+# running at emission while one of its carries is not rollable (a mutable value,
+# or a variable the body has not assigned yet, say): that is always right, and
+# only costs unrolling.
+function rollable(@nospecialize(x))
+    x isa Union{TracedRArray,TracedRNumber,Number,Iteration} && return true
+    ismutable(x) && return false
+    T = typeof(x)
+    isstructtype(T) || return true
+    return all(i -> isdefined(x, i) && rollable(getfield(x, i)), 1:fieldcount(T))
+end
+rollable(x::Union{Tuple,NamedTuple}) = all(rollable, x)
+rollable(::MissingTracedValue) = false
 
 function update!(fr::Frame, carries::Union{Tuple,NamedTuple}, next)
     length(carries) == length(next) ||
@@ -411,14 +457,31 @@ function update!(fr::Frame, c::TracedType, @nospecialize(next))
     Reactant.TracedUtils.set_mlir_data!(c, next.mlir_data)
     return nothing
 end
+# A struct is updated field by field; a host value it carries as it is must not
+# have changed.
+function update!(fr::Frame, @nospecialize(c), @nospecialize(next))
+    T = typeof(c)
+    if !isstructtype(T) || c isa Number || fieldcount(T) == 0
+        c === next && return nothing
+        return unsupported(fr, "a loop-carried host value of type $(T) that changes")
+    end
+    typeof(next).name === T.name && fieldcount(typeof(next)) == fieldcount(T) ||
+        unsupported(fr, "a loop-carried value that changes from $(T) to $(typeof(next))")
+    for i in 1:fieldcount(T)
+        isdefined(c, i) && isdefined(next, i) ||
+            unsupported(fr, "a loop-carried value with an undefined field")
+        update!(fr, getfield(c, i), getfield(next, i))
+    end
+    return nothing
+end
 
 # counted loops over traced ranges
 
 # A `for` over a traced range arrives as a general loop ending in the iterate
 # protocol; as such it would carry a body-computed `done` flag, which hides the
 # induction variable from Enzyme. Recognize the shape and roll it as counted.
-function counted_range(op::LoopOp)
-    has_return(op) && return 0
+function counted_range(fr::Frame, op::LoopOp)
+    has_return(fr, op) && return 0
     stmts = op.body.body.stmts
     isempty(stmts) && return 0
     exit = last(stmts)
@@ -426,11 +489,48 @@ function counted_range(op::LoopOp)
     then, otherwise = exit.then_region, exit.else_region
     then.terminator isa ContinueOp && otherwise.terminator isa BreakOp || return 0
     isempty(then.body.stmts) && isempty(otherwise.body.stmts) || return 0
-    any(s -> s isa IfOp && exits_loop(s), stmts[1:(end - 1)]) && return 0
+    any(s -> s isa IfOp && exits_loop(fr, s), stmts[1:(end - 1)]) && return 0
     next = iterate_of_exit(op.body, exit.condition)
     next === nothing && return 0
     k = findfirst(==(next), then.terminator.values)
     return k === nothing ? 0 : k
+end
+
+# A `for` over anything but a range runs at emission: `iterate` on an array, a
+# tuple or one of Base's iterators over them indexes by the state, which a rolled
+# loop would have to trace. The collection is the first argument of the `iterate`
+# call behind the exit test.
+function iterates_host_collection(fr::Frame, op::LoopOp)
+    stmts = op.body.body.stmts
+    isempty(stmts) && return false
+    exit = last(stmts)
+    exit isa IfOp || return false
+    next = iterate_of_exit(op.body, exit.condition)
+    next === nothing && return false
+    stmt = defining(op.body, next)
+    arg = stmt.args[stmt.head === :invoke ? 3 : 2]
+    resolvable(fr, arg) || return false
+    return indexed_by_state(operand(fr, arg))
+end
+
+resolvable(fr::Frame, x::Core.SSAValue) = isassigned(fr.ssa, x.id)
+resolvable(fr::Frame, x::BlockArgument) = isassigned(fr.blockargs, x.id)
+resolvable(::Frame, @nospecialize(x)) = true
+
+function indexed_by_state(@nospecialize(x))
+    x isa Union{AbstractRange,TracedType} && return false
+    x isa Union{AbstractArray,Tuple,NamedTuple,AbstractDict,AbstractSet} && return true
+    T = typeof(x)
+    isstructtype(T) && !ismutable(x) || return false
+    return any(1:fieldcount(T)) do i
+        isdefined(x, i) || return false
+        f = getfield(x, i)
+        return if f isa Union{Tuple,NamedTuple}
+            any(indexed_by_state, f)
+        else
+            indexed_by_state(f)
+        end
+    end
 end
 
 # The `iterate` result behind an exit test `not_int(next === nothing)`.
@@ -464,7 +564,7 @@ end
 
 is_nothing(@nospecialize(x)) = x === nothing || resolves(x, nothing)
 
-function roll_counted(fr::Frame, op::LoopOp, k::Int, carries::Tuple)
+function roll_counted(fr::Frame, op::LoopOp, k::Int, @nospecialize(carries::Tuple))
     # The first run supplies unassigned carries and the second iteration's state.
     carries = continued(fr, op, carries)
     unassigned(carries) &&
@@ -489,7 +589,7 @@ end
 unwrapped(x) = Reactant.unwrapped_eltype(x)
 
 # One run of a counted loop's body up to its exit test; the continue values.
-function continued(fr::Frame, op::LoopOp, carries::Tuple)
+function continued(fr::Frame, op::LoopOp, @nospecialize(carries::Tuple))
     fr = fork(fr; exits=false)
     bind!(fr, op.body.args, carries)
     body = op.body.body
@@ -503,7 +603,7 @@ end
 
 # iterating a traced range
 
-function iterates_traced_range(args::Tuple)
+function iterates_traced_range(@nospecialize(args::Tuple))
     length(args) in (1, 2) || return false
     args[1] isa Reactant.TracedUnitRange || return false
     return length(args) == 1 || args[2] isa Iteration

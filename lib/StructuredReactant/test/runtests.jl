@@ -31,6 +31,17 @@ function unoptimized(f, args...)
 end
 
 const x = Float32[1, 2]
+
+# A layer-like struct with a traced field, for loops over host collections.
+struct Scaling{W}
+    w::W
+end
+(s::Scaling)(x) = s.w .* x
+# A concretely typed number field cannot become traced.
+struct Tally{V}
+    n::Int
+    v::V
+end
 const y = Float32[-1, -2]
 
 @testset "StructuredReactant" begin
@@ -172,6 +183,66 @@ const y = Float32[-1, -2]
             return x
         end
         @test agrees(indexed, (x,))
+
+        # A loop over a host collection of structs: its iterator cannot be
+        # carried, so the loop unrolls even though `x` is traced from the start.
+        function stack(layers, x)
+            for l in layers
+                x = l(x)
+            end
+            return x
+        end
+        layers = [Scaling(Float32[2, 3]), Scaling(Float32[0.5, 1])]
+        @test agrees(stack, (layers, x))
+        @test !occursin("stablehlo.while", hlo(stack, layers, x))
+
+        # A host vector of traced arrays likewise: `iterate` indexes it by the state.
+        function apply_all(ws, x)
+            for w in ws
+                x = w .* x
+            end
+            return x
+        end
+        ws = [Float32[2, 3], Float32[0.5, 1]]
+        @test agrees(apply_all, (ws, x))
+        @test !occursin("stablehlo.while", hlo(apply_all, ws, x))
+
+        # An immutable struct is carried field by field, like a tuple: a decoder's
+        # cache, or here a `Scaling` rebuilt on every iteration.
+        function rescale(s::Scaling, x)
+            for i in 1:3
+                s = Scaling(s.w .* x)
+            end
+            return s.w
+        end
+        @test agrees(rescale, (Scaling(x), y))
+        @test occursin("stablehlo.while", unoptimized(rescale, Scaling(x), y))
+
+        # A field the loop cannot trace (`n::Int`) is carried as it is: fine while
+        # it stays the same, refused once the body changes it.
+        function keep_count(t::Tally, x)
+            while sum(t.v) < 8
+                t = Tally(t.n, t.v .* x)
+            end
+            return t.n, t.v
+        end
+        t = Reactant.to_rarray(Tally(2, x))   # `n` stays a host Int
+        compiled = Reactant.@compile structured(keep_count)(t, R(Float32[2, 2]))
+        @test matches(compiled(t, R(Float32[2, 2])), keep_count(Tally(2, x), Float32[2, 2]))
+        function count_up(t::Tally, x)
+            while sum(t.v) < 8
+                t = Tally(t.n + 1, t.v .* x)
+            end
+            return t.v
+        end
+        @test_throws FrontendError Reactant.@code_hlo structured(count_up)(
+            t, R(Float32[2, 2])
+        )
+
+        # Host code reaching a loop with a carry that is unassigned on entry
+        # (`2f0 ^ -0.25f0` does): the loop must run at emission, not roll.
+        powers(x) = x .* (2.0f0 .^ (-Float32.(0:2:7) ./ 8))
+        @test agrees(powers, (Float32[1, 2, 3, 4],))
 
         # The range comes from a leaf call, so `iterate` re-reads its `stop`
         # field inside the loop.

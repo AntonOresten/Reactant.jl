@@ -26,7 +26,9 @@ mutable struct Frame
     exits::Bool                    # in a general loop body: continue/break yield (done, values...)
 end
 
-function Frame(code::Code, @nospecialize(f), args::Tuple, parent::Union{Nothing,Frame})
+function Frame(
+    code::Code, @nospecialize(f), @nospecialize(args::Tuple), parent::Union{Nothing,Frame}
+)
     sci = code.sci
     return Frame(
         code,
@@ -52,7 +54,7 @@ function fork(fr::Frame; exits::Bool=fr.exits)
 end
 
 # A vararg method receives its trailing arguments as one tuple.
-function pack_arguments(method::Method, @nospecialize(f), args::Tuple)
+function pack_arguments(method::Method, @nospecialize(f), @nospecialize(args::Tuple))
     method.isva || return Any[f, args...]
     fixed = Int(method.nargs) - 2
     return Any[f, args[1:fixed]..., args[(fixed + 1):end]]
@@ -73,7 +75,15 @@ function operand(::Frame, u::Undef)
     return MissingTracedValue()
 end
 
-operands(fr::Frame, xs) = Tuple(operand(fr, x) for x in xs)
+# Filled as a vector first: `Tuple(generator)` costs the collection machinery on
+# every statement.
+function operands(fr::Frame, xs)
+    values = Vector{Any}(undef, length(xs))
+    for (i, x) in enumerate(xs)
+        values[i] = operand(fr, x)
+    end
+    return Tuple(values)
+end
 
 bind!(fr::Frame, x::Core.SSAValue, @nospecialize(v)) = (fr.ssa[x.id] = v)
 bind!(fr::Frame, x::Core.Argument, @nospecialize(v)) = (fr.arguments[x.n] = v)
@@ -162,7 +172,7 @@ function emit_block(
         idx = body.ssa_idxes[position]
         stmt = body.stmts[position]
         fr.pc = idx
-        if stmt isa IfOp && (has_return(stmt) || (fr.exits && exits_loop(stmt)))
+        if stmt isa IfOp && (has_return(fr, stmt) || (fr.exits && exits_loop(fr, stmt)))
             return emit_if(fr, stmt, Continuation(block, position, k))
         end
         fr.ssa[idx] = emit_stmt(fr, stmt)
@@ -190,17 +200,34 @@ function emit_terminator(fr::Frame, t, k::Union{Nothing,Continuation})
     return unsupported(fr, "a block without a terminator")
 end
 
-has_return(op::ControlFlowOp) = any(has_return, blocks(op))
-function has_return(block::Block)
+# Both predicates are memoized in the frame's `Code`: a block is emitted once
+# per call and per unrolled iteration, and scanning its nested regions each
+# time dominated the emission of larger programs.
+has_return(fr::Frame, op::ControlFlowOp) = has_return(fr.code.returns, op)
+function has_return(memo::IdDict{Any,Bool}, op::ControlFlowOp)
+    return get!(memo, op) do
+        return any(b -> has_return(memo, b), blocks(op))
+    end
+end
+function has_return(memo::IdDict{Any,Bool}, block::Block)
     block.terminator isa Core.ReturnNode && return true
-    return any(e -> e.stmt isa ControlFlowOp && has_return(e.stmt), values(block.body))
+    return any(values(block.body)) do e
+        return e.stmt isa ControlFlowOp && has_return(memo, e.stmt)
+    end
 end
 
 # Does a branch end the enclosing loop's iteration (`continue`/`break`) on some path?
-exits_loop(op::IfOp) = any(exits_loop, blocks(op))
-function exits_loop(block::Block)
+exits_loop(fr::Frame, op::IfOp) = exits_loop(fr.code.exits, op)
+function exits_loop(memo::IdDict{Any,Bool}, op::IfOp)
+    return get!(memo, op) do
+        return any(b -> exits_loop(memo, b), blocks(op))
+    end
+end
+function exits_loop(memo::IdDict{Any,Bool}, block::Block)
     block.terminator isa Union{BreakOp,ContinueOp} && return true
-    return any(e -> e.stmt isa IfOp && exits_loop(e.stmt), values(block.body))
+    return any(values(block.body)) do e
+        return e.stmt isa IfOp && exits_loop(memo, e.stmt)
+    end
 end
 
 emit_stmt(fr::Frame, @nospecialize(stmt)) = operand(fr, stmt)
@@ -296,7 +323,7 @@ function reparameterize(T::DataType, fields::Vector{Any})
 end
 
 # Builtins and calls without traced arguments run in Julia.
-function emit_call(fr::Frame, @nospecialize(f), args::Tuple)
+function emit_call(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
     if f isa Core.IntrinsicFunction   # intrinsics are builtins too; test them first
         return emit_intrinsic(fr, f, args)
     elseif f isa Core.Builtin
@@ -310,14 +337,16 @@ end
 # Counting leaf calls tells emitting loop iterations from host ones.
 const EMISSIONS = Ref(0)
 
-function leaf(@nospecialize(f), args::Tuple)
+function leaf(@nospecialize(f), @nospecialize(args::Tuple))
     EMISSIONS[] += 1
     return Reactant.call_with_reactant(f, map(structure_callback, args)...)
 end
 
 # Dispatch on the runtime argument types: a leaf is called through Reactant with
 # user callbacks among its arguments wrapped; any other method is emitted.
-function emit_method(@nospecialize(f), args::Tuple, parent::Union{Nothing,Frame})
+function emit_method(
+    @nospecialize(f), @nospecialize(args::Tuple), parent::Union{Nothing,Frame}
+)
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
     sig = Tuple{Core.Typeof(f),map(Core.Typeof, args)...}
@@ -353,7 +382,7 @@ function structure_callback(@nospecialize(x))
     return structured(x)
 end
 
-function emit_builtin(fr::Frame, @nospecialize(f), args::Tuple)
+function emit_builtin(fr::Frame, @nospecialize(f), @nospecialize(args::Tuple))
     if f === Core._apply_iterate
         flat = Any[]
         for iterable in args[3:end]
