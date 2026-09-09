@@ -573,14 +573,12 @@ function defining(block::Block, @nospecialize(v))
     return entry === nothing ? nothing : entry.stmt
 end
 
-function is_call(
-    @nospecialize(stmt), target, nargs::Int, world::UInt=Base.get_world_counter()
-)
+function is_call(@nospecialize(stmt), target, nargs::Int, world::UInt=Base.tls_world_age())
     stmt isa Expr && stmt.head === :call && length(stmt.args) == nargs + 1 || return false
     return resolves(stmt.args[1], target, world)
 end
 
-function resolves(@nospecialize(f), target, world::UInt=Base.get_world_counter())
+function resolves(@nospecialize(f), target, world::UInt=Base.tls_world_age())
     f isa GlobalRef && (f = Base.invoke_in_world(world, global_value, f))
     return f === target
 end

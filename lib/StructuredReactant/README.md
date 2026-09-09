@@ -89,8 +89,9 @@ is checked again after a world change so a new, more specific overload is honore
 Each active call owns its execution buffers. The compiler infrastructure runs
 in the world captured when the package loads, preserving its precompiled native
 code across later package loads. User method lookup and global reads use the
-user program's world. Developers changing these compiler routines should restart
-Julia to refresh the captured world.
+user program's world, including when a trace yields while a method is edited.
+Developers changing these compiler routines should restart Julia to refresh the
+captured world.
 
 ## Scope
 

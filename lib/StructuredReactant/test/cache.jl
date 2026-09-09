@@ -7,6 +7,25 @@ dispatch(x) = x
 source_user(x) = sum(x) > 0 ? x .* 2 : -x
 behind_leaf(x) = 1
 leaf_parent(x) = Reactant.structured_cache_test_leaf(x)
+
+@noinline world_child(x) = x .+ 1.0f0
+world_parent(x) = world_child(x)
+world_branch(x) = sum(x) > 0 ? world_child(x) : -world_child(x)
+const entered = Channel{Nothing}(1)
+const resume = Channel{Nothing}(1)
+@noinline function checkpoint()
+    put!(entered, nothing)
+    take!(resume)
+    return nothing
+end
+# Synchronization belongs to the test harness, outside Reactant's overlay.
+Reactant.@skip_rewrite_func checkpoint
+function world_twice(x)
+    first = world_child(x)
+    checkpoint()
+    second = world_child(x)
+    return first, second
+end
 end
 
 @eval Reactant structured_cache_test_leaf(x::TracedRArray) = Main.CacheCases.behind_leaf(x)
@@ -77,7 +96,11 @@ end
     @eval CacheCases late_helper(x, scale) = x .* scale
     @eval CacheCases late_root(x) = late_helper(x, 2.0f0)
     @test resolve(CacheCases.late_root).code isa SR.Code
-    @test SR.resolves(GlobalRef(CacheCases, :late_helper), CacheCases.late_helper)
+    @test SR.resolves(
+        GlobalRef(CacheCases, :late_helper),
+        CacheCases.late_helper,
+        Base.get_world_counter(),
+    )
 
     @static if VERSION >= v"1.12-"
         @eval CacheCases const selected = source_user
@@ -86,6 +109,41 @@ end
         @test SR.resolves(
             GlobalRef(CacheCases, :selected), CacheCases.source_user, previous_world
         )
-        @test SR.resolves(GlobalRef(CacheCases, :selected), CacheCases.independent)
+        @test SR.resolves(
+            GlobalRef(CacheCases, :selected),
+            CacheCases.independent,
+            Base.get_world_counter(),
+        )
+    end
+end
+
+@testset "Tracing world" begin
+    x = Reactant.to_rarray(Float32[1, 2])
+    previous_world = Base.get_world_counter()
+    @eval CacheCases @noinline world_child(x) = x .+ 2.0f0
+    for f in (CacheCases.world_parent, CacheCases.world_branch)
+        before = Base.invoke_in_world(previous_world, Reactant.compile, structured(f), (x,))
+        after = Base.invokelatest(Reactant.compile, structured(f), (x,))
+        @test Array(before(x)) == Float32[2, 3]
+        @test Array(after(x)) == Float32[3, 4]
+    end
+
+    # A host callback yields while tracing, allowing a method edit between two
+    # calls to the same non-inlined helper. Both calls must use the original world.
+    job = @async Base.invokelatest(
+        Reactant.compile, structured(CacheCases.world_twice), (x,)
+    )
+    ready = timedwait(() -> isready(CacheCases.entered) || istaskdone(job), 30.0)
+    @test ready === :ok
+    if isready(CacheCases.entered)
+        take!(CacheCases.entered)
+        @eval CacheCases @noinline world_child(x) = x .+ 3.0f0
+        put!(CacheCases.resume, nothing)
+        first, second = fetch(job)(x)
+        @test Array(first) == Float32[3, 4]
+        @test Array(second) == Float32[3, 4]
+    else
+        put!(CacheCases.resume, nothing) # release a late callback if the wait timed out
+        fetch(job) # surface a compilation failure instead of waiting for a callback
     end
 end

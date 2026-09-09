@@ -439,7 +439,8 @@ function emit_method(@nospecialize(f), args::Vector{Any}, parent::Union{Nothing,
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
     sig = Tuple{Core.Typeof(f),map_arguments(Core.Typeof, args)...}
-    resolution = resolve(sig, Base.get_world_counter())
+    # A trace must keep the caller's world, including after yielding to an editor.
+    resolution = resolve(sig, Base.tls_world_age())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
     code = resolution.code
     code === nothing && return leaf(f, args)
