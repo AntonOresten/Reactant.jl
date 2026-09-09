@@ -296,10 +296,11 @@ function is_pure(func)
     return true
 end
 
-function make_mlir_fn(
-    f,
-    args,
-    kwargs,
+# The tracing driver is shared; call_with_reactant specializes the traced program.
+Base.@nospecializeinfer function make_mlir_fn(
+    @nospecialize(f),
+    @nospecialize(args),
+    @nospecialize(kwargs),
     name="main",
     concretein=true;
     toscalar=false,
