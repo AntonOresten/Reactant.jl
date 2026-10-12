@@ -18,17 +18,15 @@ mutable struct PreparedCode
 end
 PreparedCode() = PreparedCode(nothing)
 
-# Dispatch is cached only within one world: a newly added overload can select a
-# different MethodInstance without invalidating the previously selected one.
-# After a world change we repeat lookup, then reuse the CodeInstance's results.
+# What a signature dispatches to in one world: a new overload can select another
+# method without invalidating the old one. The prepared code outlives it on `ci`.
 struct Resolution
-    code::Union{Nothing,Code} # nothing marks a native leaf
+    code::Union{Nothing,Code}   # `nothing` marks a leaf
     world::UInt
     ci::Union{Nothing,Core.CodeInstance}
 end
 
-# An `IdDict`: its methods do not specialize on the key, a `Dict{Type,...}`'s do,
-# once per signature.
+# An `IdDict`: storing into a `Dict{Type}` compiles once per signature.
 const RESOLUTIONS = IdDict{Any,Resolution}()
 const RESOLUTIONS_LOCK = ReentrantLock()
 
@@ -63,43 +61,51 @@ function resolve_locked(@nospecialize(sig::Type), world::UInt)
     resolution = if isleaf(match.method, sig)
         Resolution(nothing, world, nothing)
     else
-        mi = specialization(interp, match, sig)
-        cache = CacheView{PreparedCode}(CC.cache_owner(interp), world)
-        ci = get(cache, mi, nothing)
-        ci === nothing && (ci = CompilerCaching.typeinf!(interp, mi))
-        ci === nothing && throw(FrontendError("inference of $(sig) failed"))
-        prepared = CompilerCaching.results(cache, ci)
-        if prepared.code === nothing
-            src = CompilerCaching.get_source(ci)
-            if src === nothing
-                ci = CompilerCaching.typeinf!(interp, mi)
-                src = ci === nothing ? nothing : CompilerCaching.get_source(ci)
-            end
-            src === nothing &&
-                throw(FrontendError("inferred source of $(sig) unavailable"))
-            # inflate_ir copies the source: cleanup/structurization must not
-            # mutate code that inference and other resolutions still use.
-            ir = CC.inflate_ir(src, mi)
-            ir = strip_exception_handling!(ir, world)
-            STRUCTURIZER_HOISTS || dedup_getfield!(ir, world)
-            sci = try
-                StructuredIRCode(ir)
-            catch err
-                message = sprint(showerror, err)
-                throw(
-                    FrontendError(
-                        "the control flow of $(match.method) could not be structured: " *
-                        message,
-                    ),
-                )
-            end
-            prepared = CompilerCaching.results(cache, ci)
-            prepared.code = Code(sci, match.method, mi.sparam_vals)
-        end
-        Resolution(prepared.code, world, ci)
+        ci, code = prepared_code(interp, match, specialization(interp, match, sig), sig)
+        Resolution(code, world, ci)
     end
     RESOLUTIONS[sig] = resolution
     return resolution
+end
+
+# The CodeInstance of `mi` and its structured IR, built once per CodeInstance.
+function prepared_code(
+    interp::Interpreter, match::Core.MethodMatch, mi::Core.MethodInstance, @nospecialize(sig)
+)
+    cache = CacheView{PreparedCode}(CC.cache_owner(interp), interp.world)
+    ci = get(cache, mi, nothing)
+    ci === nothing && (ci = CompilerCaching.typeinf!(interp, mi))
+    ci === nothing && throw(FrontendError("inference of $(sig) failed"))
+    prepared = CompilerCaching.results(cache, ci)
+    prepared.code === nothing || return ci, prepared.code
+
+    src = CompilerCaching.get_source(ci)
+    if src === nothing   # cached without its source: infer again
+        ci = CompilerCaching.typeinf!(interp, mi)
+        src = ci === nothing ? nothing : CompilerCaching.get_source(ci)
+        src === nothing && throw(FrontendError("inferred source of $(sig) unavailable"))
+        prepared = CompilerCaching.results(cache, ci)
+    end
+    prepared.code = structure(CC.inflate_ir(src, mi), match.method, mi, interp.world)
+    return ci, prepared.code
+end
+
+# `ir` is a copy (`inflate_ir` makes one): inference and other resolutions still
+# use the cached source. Cleanup reads globals in the traced program's `world`.
+function structure(ir::CC.IRCode, method::Method, mi::Core.MethodInstance, world::UInt)
+    ir = strip_exception_handling!(ir, world)
+    STRUCTURIZER_HOISTS || dedup_getfield!(ir, world)
+    sci = try
+        StructuredIRCode(ir)
+    catch err
+        message = sprint(showerror, err)
+        throw(
+            FrontendError(
+                "the control flow of $(method) could not be structured: " * message
+            ),
+        )
+    end
+    return Code(sci, method, mi.sparam_vals)
 end
 
 # Traced Bool arguments are admitted as host Bools, as leaf results are; the
