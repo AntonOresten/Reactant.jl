@@ -186,13 +186,13 @@ struct Token
     mlir_data::MLIR.IR.Value
 end
 
-const __TLSEntryBlockType = Tuple{MLIR.IR.Block,Dict{MLIR.IR.Attribute,TracedRArray}}
+const __TLSEntryBlockType = Tuple{MLIR.IR.Block,Dict{MLIR.IR.Attribute,MLIR.IR.Value}}
 
 function activate_constant_context!(blk::MLIR.IR.Block)
     stack = get!(task_local_storage(), :entry_block) do
         return __TLSEntryBlockType[]
     end::Vector{__TLSEntryBlockType}
-    Base.push!(stack, (blk, Dict{MLIR.IR.Attribute,TracedRArray}()))
+    Base.push!(stack, (blk, Dict{MLIR.IR.Attribute,MLIR.IR.Value}()))
     return nothing
 end
 
@@ -231,9 +231,7 @@ end
     constant_blk, constants = constant_context()
     parent = MLIR.IR.parent_op(constant_blk)
     @assert MLIR.IR.name(parent) != "builtin.module"
-    if haskey(constants, value)
-        return constants[value]
-    else
+    if !haskey(constants, value)
         output = mlir_type(TracedRArray{T,N}, size(x))
 
         op_ty_results = MLIR.IR.Type[output]
@@ -253,11 +251,11 @@ end
             result_inference=false,
         )
 
-        res = MLIR.IR.result(cstop)
-        tres = TracedRArray{T,N}((), res, size(x))
-        constants[value] = tres
-        return tres
+        constants[value] = MLIR.IR.result(cstop)
     end
+    # Cache the value, not the array: updating an array in place rebinds its
+    # value, which must not change other uses of the same constant.
+    return TracedRArray{T,N}((), constants[value], size(x))
 end
 
 @noinline function constant(

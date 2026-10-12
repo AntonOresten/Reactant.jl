@@ -200,6 +200,18 @@ end
     end
 end
 
+@testset "constant reused after an in-place update" begin
+    function update_then_reuse(x)
+        a = Ops.constant([1.0, 2.0])
+        a .+= x
+        b = Ops.constant([1.0, 2.0])
+        return a, b
+    end
+    a, b = @jit update_then_reuse(Reactant.to_rarray([3.0, 4.0]))
+    @test Array(a) ≈ [4.0, 6.0]
+    @test Array(b) ≈ [1.0, 2.0]
+end
+
 @testset "cosine" begin
     # it crashes in apple x86_64 and it's a deprecated platform so we don't need to care a lot...
     x = Reactant.to_rarray([0, π / 2, π, 3π / 2, 2π])
