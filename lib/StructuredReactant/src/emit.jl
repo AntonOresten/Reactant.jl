@@ -112,15 +112,7 @@ function operand(::Frame, u::Undef)
     return MissingTracedValue()
 end
 
-# Filled as a vector first: `Tuple(generator)` costs the collection machinery on
-# every statement.
-function operands(fr::Frame, xs)
-    values = Vector{Any}(undef, length(xs))
-    for (i, x) in enumerate(xs)
-        values[i] = operand(fr, x)
-    end
-    return Tuple(values)
-end
+operands(fr::Frame, xs) = Tuple(operand(fr, x) for x in xs)
 
 # Tuple traversals that do not specialize on the tuple's type: the emitter meets
 # one argument tuple type per call site of the program, and `any(f, t)` or
@@ -408,22 +400,14 @@ function emit_call(fr::Frame, @nospecialize(f), args::Vector{Any})
     return Reactant.call_with_reactant(f, args...)
 end
 
-# Keep the result element type fixed. `map` widens a vector from its first
-# result, compiling collection helpers for the program's argument types.
-function map_arguments(f, args::Vector{Any})
-    values = Vector{Any}(undef, length(args))
-    for i in eachindex(args)
-        values[i] = f(args[i])
-    end
-    return values
-end
-
 # Counting leaf calls tells emitting loop iterations from host ones.
 const EMISSIONS = Ref(0)
 
 function leaf(@nospecialize(f), args::Vector{Any})
     EMISSIONS[] += 1
-    return Reactant.call_with_reactant(f, map_arguments(structure_callback, args)...)
+    # `Any[...]`, not `map`, which would narrow and widen the element type by the
+    # program's argument types, compiling for each.
+    return Reactant.call_with_reactant(f, Any[structure_callback(a) for a in args]...)
 end
 
 # Dispatch on the runtime argument types: a leaf is called through Reactant with
@@ -436,7 +420,7 @@ end
 function emit_method(@nospecialize(f), args::Vector{Any}, parent::Union{Nothing,Frame})
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
-    sig = Tuple{Core.Typeof(f),map_arguments(Core.Typeof, args)...}
+    sig = Tuple{Core.Typeof(f),Any[Core.Typeof(a) for a in args]...}
     # A trace must keep the caller's world, including after yielding to an editor.
     resolution = resolve(sig, Base.tls_world_age())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
@@ -470,18 +454,6 @@ function structure_callback(@nospecialize(x))
     return structured(x)
 end
 
-# Most builtin calls have a small, fixed arity. Passing the values directly
-# avoids the argument packing of `_apply_iterate` on every interpreted call.
-@inline function apply_builtin(f::Core.Builtin, args::Vector{Any})
-    n = length(args)
-    n == 0 && return f()
-    n == 1 && return f(args[1])
-    n == 2 && return f(args[1], args[2])
-    n == 3 && return f(args[1], args[2], args[3])
-    n == 4 && return f(args[1], args[2], args[3], args[4])
-    return f(args...)
-end
-
 function emit_builtin(fr::Frame, @nospecialize(f), args::Vector{Any})
     if f === Core._apply_iterate
         flat = Any[]
@@ -503,7 +475,7 @@ function emit_builtin(fr::Frame, @nospecialize(f), args::Vector{Any})
     elseif f === Core.getfield && length(args) >= 2 && args[2] isa TracedRNumber
         unsupported(fr, "indexing a tuple or struct with a traced integer")
     end
-    return apply_builtin(f, args)
+    return f(args...)
 end
 
 # Structurization synthesizes `===` on integer discriminators, which turn traced

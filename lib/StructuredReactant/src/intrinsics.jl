@@ -2,7 +2,7 @@
 # traced after inference (loop carries, traced branches); map them to `Base`.
 
 function emit_intrinsic(fr::Frame, f::Core.IntrinsicFunction, args::Vector{Any})
-    any(a -> a isa TracedRNumber, args) || return apply_builtin(f, args)
+    any(a -> a isa TracedRNumber, args) || return f(args...)
     op = get(TRACED_INTRINSICS, f, nothing)
     op === nothing && unsupported(fr, "the `$(f)` intrinsic on traced operands")
     return op(args...)
