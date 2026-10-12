@@ -31,3 +31,25 @@ using Reactant: MLIR
         MLIR.IR.dispose(mod)
     end
 end
+
+@testset "enable_ir_printing!" begin
+    MLIR.IR.@with_context Reactant.ReactantContext() begin
+        mod = parse(
+            MLIR.IR.Module, "func.func @identity(%x: i32) -> i32 { return %x : i32 }"
+        )
+        pm = MLIR.IR.PassManager()
+        MLIR.IR.add_pipeline!(MLIR.IR.OpPassManager(pm), "canonicalize")
+        output = mktemp() do _, io
+            redirect_stderr(io) do
+                @test MLIR.IR.enable_ir_printing!(pm; before_all=true) === pm
+                MLIR.IR.run!(pm, MLIR.IR.Operation(mod))
+            end
+            seekstart(io)
+            return read(io, String)
+        end
+        @test occursin("IR Dump Before", output)
+        @test occursin("@identity", output)
+        MLIR.IR.dispose(pm)
+        MLIR.IR.dispose(mod)
+    end
+end
