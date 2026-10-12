@@ -24,9 +24,9 @@ using IRStructurizer:
 
 const CC = Core.Compiler
 
-# Keep native compiler infrastructure usable after later package loads. User
-# methods are still inferred in the explicit world supplied to Interpreter.
-# During precompilation invoke_in_world clamps typemax to the current world.
+# The world the compiler runs in, fixed at load so that later package loads do
+# not invalidate its native code; user code is inferred in the traced program's.
+# `invoke_in_world` clamps the precompilation value to the current world.
 const COMPILER_WORLD = Ref{UInt}(typemax(UInt))
 
 function __init__()

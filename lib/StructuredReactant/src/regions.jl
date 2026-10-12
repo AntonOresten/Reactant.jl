@@ -400,11 +400,9 @@ carry(fr::Frame, x::Iteration) = Iteration(carry(fr, x.i), carry(fr, x.stop))
 function carry(fr::Frame, x::MissingTracedValue)
     return unsupported(fr, "reading a value after a loop that is only assigned inside it")
 end
-# Any other immutable value is carried field by field, like a tuple (a decoder's
-# cache, say), and rebuilt through its constructor. A host number field becomes
-# a traced constant when the field's declared type admits one (a type parameter
-# or an abstract type); whatever else a field holds, a concretely typed number or
-# a symbol, is kept as it is and must stay the same on every iteration.
+# Any other immutable value is carried field by field and rebuilt through its
+# constructor. A host number becomes traced where its field's declared type admits
+# it; any other host field is kept as it is and must not change.
 function carry(fr::Frame, @nospecialize(x))
     T = typeof(x)
     ismutable(x) && return unsupported(fr, "a loop-carried value of type $(T)")
@@ -429,10 +427,8 @@ function admits_traced(T::DataType, i::Int, @nospecialize(x::Number))
     end
 end
 
-# Whether `carry` accepts `x`. A loop whose condition is still a host value keeps
-# running at emission while one of its carries is not rollable (a mutable value,
-# or a variable the body has not assigned yet, say): that is always right, and
-# only costs unrolling.
+# Whether `carry` accepts `x`. A host loop runs at emission while a carry is not
+# rollable, which is always correct and only costs unrolling.
 function rollable(@nospecialize(x))
     x isa Union{TracedRArray,TracedRNumber,Number,Iteration} && return true
     ismutable(x) && return false
@@ -477,8 +473,7 @@ function update!(fr::Frame, c::TracedType, @nospecialize(next))
     Reactant.TracedUtils.set_mlir_data!(c, next.mlir_data)
     return nothing
 end
-# A struct is updated field by field; a host value it carries as it is must not
-# have changed.
+# A struct is updated field by field; a host value it carries must not change.
 function update!(fr::Frame, @nospecialize(c), @nospecialize(next))
     T = typeof(c)
     if !isstructtype(T) || c isa Number || fieldcount(T) == 0
@@ -518,8 +513,7 @@ end
 
 # A `for` over anything but a range runs at emission: `iterate` on an array, a
 # tuple or one of Base's iterators over them indexes by the state, which a rolled
-# loop would have to trace. The collection is the first argument of the `iterate`
-# call behind the exit test.
+# loop would have to trace.
 function iterates_host_collection(fr::Frame, op::LoopOp)
     stmts = op.body.body.stmts
     isempty(stmts) && return false
@@ -584,8 +578,7 @@ function resolves(@nospecialize(f), target, world::UInt=Base.tls_world_age())
     return f === target
 end
 
-# IR may refer to globals defined after the compiler's initialization world.
-# Read them in the user program's world, including when cleaning up inferred IR.
+# In the traced program's world: IR may name globals defined after the compiler's.
 function global_value(ref::GlobalRef)
     return isdefined(ref.mod, ref.name) ? getglobal(ref.mod, ref.name) : missing
 end

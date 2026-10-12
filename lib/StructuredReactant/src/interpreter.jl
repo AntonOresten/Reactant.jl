@@ -64,10 +64,9 @@ function involves_reactant(@nospecialize(T))
     return false
 end
 
-# Keep host loops out of traced callers: otherwise bulk host work becomes one
-# interpreted statement at a time. Small host helpers still inline, including
-# iteration primitives whose state may become traced when their caller rolls a
-# loop. Sources stay uncompressed so the policy can inspect their control flow.
+# Leaves, foreign calls, exception handlers and host callees with loops stay out
+# of line, where they run natively rather than one interpreted statement at a
+# time; small host helpers still inline. Sources stay uncompressed for the policy.
 CC.may_compress(::Interpreter) = false
 
 function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))

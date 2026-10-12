@@ -53,8 +53,7 @@ function fork(fr::Frame; exits::Bool=fr.exits)
     )
 end
 
-# A host loop reuses its child activation. Copy the slots, including undefined
-# ones, before each iteration; nested loops still have their own child frames.
+# Makes `dest` a fresh fork of `source` again, for the next host loop iteration.
 function reset_frame!(dest::Frame, source::Frame; exits::Bool=source.exits)
     copyto!(dest.arguments, source.arguments)
     copyto!(dest.ssa, source.ssa)
@@ -102,9 +101,8 @@ end
 
 operands(fr::Frame, xs) = Any[operand(fr, x) for x in xs]
 
-# Tuple traversals that do not specialize on the tuple's type: the emitter meets
-# one argument tuple type per call site of the program, and `any(f, t)` or
-# `map(f, t)` would have Julia compile once for each of them.
+# `any`, `all` and `map` that do not specialize on the tuple's type, which the
+# Base functions do, once per tuple type of the program.
 function tuple_any(f, @nospecialize(t::Union{Tuple,NamedTuple}))
     for i in 1:nfields(t)
         f(getfield(t, i)) && return true
@@ -371,8 +369,8 @@ function reparameterize(T::DataType, fields::Vector{Any})
     return T.name.wrapper{params...}
 end
 
-# Calls without traced arguments run natively through Reactant: even a host-only
-# helper can depend on overlays or `within_compile()`. Builtins are handled here.
+# Builtins are handled here. Calls without traced arguments run through Reactant,
+# since a host helper can still depend on its overlays or `within_compile()`.
 function emit_call(fr::Frame, @nospecialize(f), args::Vector{Any})
     if f isa Core.IntrinsicFunction   # intrinsics are builtins too; test them first
         return emit_intrinsic(fr, f, args)
@@ -389,8 +387,7 @@ const EMISSIONS = Ref(0)
 
 function leaf(@nospecialize(f), args::Vector{Any})
     EMISSIONS[] += 1
-    # `Any[...]`, not `map`, which would narrow and widen the element type by the
-    # program's argument types, compiling for each.
+    # `Any[...]`: `map` would type its result by the arguments, compiling for each.
     return Reactant.call_with_reactant(f, Any[structure_callback(a) for a in args]...)
 end
 
@@ -405,7 +402,7 @@ function emit_method(@nospecialize(f), args::Vector{Any}, parent::Union{Nothing,
     f === Base.iterate && iterates_traced_range(args) && return traced_iterate(args...)
     Reactant.should_rewrite_call(Core.Typeof(f)) || return leaf(f, args)
     sig = Tuple{Core.Typeof(f),Any[Core.Typeof(a) for a in args]...}
-    # A trace must keep the caller's world, including after yielding to an editor.
+    # The trace's world, unchanged by method definitions while it yields.
     resolution = resolve(sig, Base.tls_world_age())
     resolution === nothing && return f(args...)   # no method: Julia raises the MethodError
     code = resolution.code

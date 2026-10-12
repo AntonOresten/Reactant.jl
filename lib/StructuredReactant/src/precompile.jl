@@ -1,5 +1,4 @@
-# Exercise the inference and emission paths through one entry point, so Julia
-# does not compile Reactant's whole pipeline for several workload function types.
+# One workload function: Julia compiles Reactant's pipeline once per function type.
 using PrecompileTools: @setup_workload, @compile_workload
 
 @setup_workload begin
@@ -29,7 +28,6 @@ using PrecompileTools: @setup_workload, @compile_workload
             Reactant.@code_hlo optimize=false structured(workload)(x, n)
         end
     end
-    # Dispatch lookups contain this process's world numbers. CodeInstances and
-    # their prepared results are serialized with Julia's dependency tracking.
+    # Resolutions hold this process's worlds; CodeInstances carry their prepared code.
     empty!(RESOLUTIONS)
 end
