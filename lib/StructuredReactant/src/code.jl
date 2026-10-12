@@ -42,8 +42,8 @@ end
 # What `sig` dispatches to in `world`: `nothing` without a method, a leaf, or
 # the method's structured IR; cached until a method definition invalidates it.
 function resolve(@nospecialize(sig::Type), world::UInt)
-    # Not `lock(f, l)`: a closure over `sig` has one type per signature and would
-    # have Julia compile `lock` once for each.
+    # Not `lock(f, l)`: Julia 1.12 types a closure by the exact type of what it
+    # captures, `Type{sig}` here, and would compile `lock` once per signature.
     lock(RESOLUTIONS_LOCK)
     try
         return Base.invoke_in_world(

@@ -356,14 +356,11 @@ end
 # was given, so the object is rebuilt through its constructor.
 function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
     T isa DataType || unsupported(fr, "constructing a value of type $(T)")
-    if fields_match(T, fields)
+    if fields_match(T, fields) || !any(has_traced, fields)
         return ccall(
             :jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields)
         )
     end
-    any(has_traced, fields) || return ccall(
-        :jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields)
-    )
     T <: NamedTuple && return NamedTuple{fieldnames(T)}(Tuple(fields))
     # `a:b` inlined to a `UnitRange`; with traced endpoints it is Reactant's range.
     T <: UnitRange && return Reactant.call_with_reactant(:, fields[1], fields[2])
@@ -377,7 +374,8 @@ function construct(fr::Frame, @nospecialize(T), fields::Vector{Any})
     return wrapper(fields...)
 end
 
-# A loop, not `all(closure, ...)`: a closure over `T` would have a type per `T`.
+# A loop: on Julia 1.12 a closure over `T` has the type `Type{T}` in it, so `all`
+# would be compiled once per struct type.
 function fields_match(@nospecialize(T::DataType), fields::Vector{Any})
     for i in eachindex(fields)
         fields[i] isa fieldtype(T, i) || return false

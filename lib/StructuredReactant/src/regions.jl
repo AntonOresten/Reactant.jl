@@ -438,12 +438,13 @@ function rollable(@nospecialize(x))
     ismutable(x) && return false
     T = typeof(x)
     isstructtype(T) || return true
-    for i in 1:fieldcount(T)   # not `all(closure, ...)`: a closure over `x` has a type per T
+    # Not `all(closure, ...)`: on Julia 1.11 and 1.12 a closure over `x` has a
+    # type, and `all` a compilation, per type of `x`.
+    for i in 1:fieldcount(T)
         isdefined(x, i) && rollable(getfield(x, i)) || return false
     end
     return true
 end
-rollable(@nospecialize(x::Union{Tuple,NamedTuple})) = tuple_all(rollable, x)
 rollable(::MissingTracedValue) = false
 
 function update!(
