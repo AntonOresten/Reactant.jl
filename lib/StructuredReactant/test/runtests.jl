@@ -31,6 +31,7 @@ function unoptimized(f, args...)
 end
 
 const x = Float32[1, 2]
+const y = Float32[-1, -2]
 
 # A layer-like struct with a traced field, for loops over host collections.
 struct Scaling{W}
@@ -42,7 +43,6 @@ struct Tally{V}
     n::Int
     v::V
 end
-const y = Float32[-1, -2]
 
 module PreparedGlobals
 gain = 1.0f0
@@ -245,8 +245,7 @@ end
         @test agrees(apply_all, (ws, x))
         @test !occursin("stablehlo.while", hlo(apply_all, ws, x))
 
-        # An immutable struct is carried field by field, like a tuple: a decoder's
-        # cache, or here a `Scaling` rebuilt on every iteration.
+        # An immutable struct is carried field by field, like a tuple.
         function rescale(s::Scaling, x)
             for i in 1:3
                 s = Scaling(s.w .* x)
@@ -653,8 +652,7 @@ end
         # A traced condition behind an Any field must still reach the frontend.
         @test occursin("stablehlo.if", hlo(HostBoundary.hidden_user, x))
 
-        # The host broadcast loops must stay native, even inside a traced caller.
-        # Check the boundary directly rather than asserting a wall-clock budget.
+        # The host broadcast loops stay native, even inside a traced caller.
         SR = StructuredReactant
         sig = Tuple{typeof(HostBoundary.tables),Reactant.TracedRArray{Float32,1}}
         code = SR.resolve(sig, Base.get_world_counter()).code

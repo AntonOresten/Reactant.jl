@@ -44,8 +44,7 @@ end
     @test reused.ci === before.ci
     @test reused.code === before.code
 
-    # The signature table is only a fast dispatch cache. Prepared code lives on
-    # the CI and survives rebuilding that table.
+    # RESOLUTIONS only caches dispatch; the prepared code lives on the CI.
     empty!(SR.RESOLUTIONS)
     @test resolve(CacheCases.parent).code === before.code
 
@@ -91,8 +90,7 @@ end
     @test leaf_changed.ci.rettype === Float32
 
     # Cleanup runs in the compiler world, but a two-argument call can refer to
-    # a global first defined in the user's later world (the getfield scan used
-    # to read such globals directly).
+    # a global first defined in the user's later world.
     @eval CacheCases late_helper(x, scale) = x .* scale
     @eval CacheCases late_root(x) = late_helper(x, 2.0f0)
     @test resolve(CacheCases.late_root).code isa SR.Code
