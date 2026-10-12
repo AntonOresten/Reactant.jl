@@ -20,6 +20,31 @@ function Base.getindex(a::TracedRArray{T,0}, ::CartesianIndex{0}) where {T}
     return TracedRNumber{T}((), a.mlir_data)
 end
 
+# Base's view index protocol accepts Real and AbstractArray. A rank-zero array
+# retains the scalar index's dimension-dropping behavior without converting it to Int.
+view_index(i) = i
+function view_index(i::TracedRNumber{T}) where {T<:Integer}
+    return TracedRArray{T,0}((), i.mlir_data, ())
+end
+
+# Keep nested views intact: collapsing them can extract a traced scalar again.
+# The ViewIndex methods resolve overlaps with Base's ordinary constructors.
+for AT in (AbstractArray{<:TracedRNumber}, SubArray{<:TracedRNumber})
+    @eval function Base.unsafe_view(
+        a::$AT, indices::Vararg{Union{Base.ViewIndex,TracedRNumber{<:Integer}},N}
+    ) where {N}
+        return SubArray(a, map(view_index, indices))
+    end
+    @eval function Base.unsafe_view(a::$AT, indices::Vararg{Base.ViewIndex,N}) where {N}
+        return SubArray(a, indices)
+    end
+end
+
+function Base.copy(v::SubArray{TracedRNumber{T},N}) where {T,N}
+    value = @allowscalar materialize_traced_array(v)
+    return copy(Reactant.promote_to(TracedRArray{T,N}, value))
+end
+
 ## Array Indexing
 ### Scalar Indexing
 function Base.getindex(
@@ -317,7 +342,7 @@ end
 # TODO(#2237): some of these dispatches can be optimized
 for idxtype in (AbstractArray, AbstractUnitRange{<:Integer}, StepRange{<:Integer})
     @eval function Base.getindex(v::TracedUnitRange{T}, i::$idxtype) where {T}
-        return getindex(Reactant.promote_to(TracedRArray{T,1}, v), i)
+        return getindex(Reactant.promote_to(TracedRArray{unwrapped_eltype(v),1}, v), i)
     end
 end
 
@@ -573,7 +598,8 @@ function getindex_general(a::TracedRArray{T,N}, indices::Vararg{Any,N}) where {T
         end
     end
 
-    if use_gather_getindex
+    # A dynamic scalar may follow a strided dimension in the index tuple.
+    if use_gather_getindex || (use_dynamic_slice && !all(isone, strides))
         # TODO(#2237): This will create a dynamically sized tensor and we need to implement
         #       `findall` for it.
         if any(i -> unwrapped_eltype(i) <: Bool, indices)

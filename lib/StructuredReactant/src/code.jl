@@ -227,7 +227,9 @@ end
 # The inlined `iterate` over a range from a leaf call re-reads `stop` inside the
 # loop; IRStructurizer up to 0.6.4 then takes that body-defined value as the
 # bound. Later releases hoist such reads (maleadt/IRStructurizer.jl#62).
-const STRUCTURIZER_HOISTS = pkgversion(IRStructurizer) > v"0.6.4"
+# Main can contain the fix before its package version changes.
+const STRUCTURIZER_HOISTS = pkgversion(IRStructurizer) > v"0.6.4" ||
+                           isdefined(IRStructurizer, :collect_hoists)
 
 function dedup_getfield!(ir::CC.IRCode, world::UInt)
     domtree = CC.construct_domtree(ir.cfg.blocks)

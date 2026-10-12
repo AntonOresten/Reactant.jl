@@ -11,3 +11,10 @@ end
 function Base.getindex(::CHOLMOD.Sparse{<:TracedRNumber}, ::Int64, ::Int64)
     return error("Sparse arrays are not supported by reactant yet.")
 end
+
+# Resolve copy's overlap with SparseArrays while retaining the unsupported-type diagnostic.
+function Base.copy(
+    ::SubArray{TracedRNumber{T},N,P}
+) where {T,N,P<:Union{SparseArrays.SparseVector,AbstractSparseMatrixCSC}}
+    return error("Sparse arrays are not supported by reactant yet.")
+end

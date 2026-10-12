@@ -60,8 +60,20 @@ function ReactantCore.materialize_traced_array(
     return @opcall add(@opcall(multiply(step_arr, iota)), first_arr)
 end
 
+# Traced materialization drops offset axes; host parents may retain them.
+# Translate view coordinates into the materialized parent's actual axes.
+function materialized_parent_indices(x::SubArray, a::AbstractArray)
+    return map(
+        Base.reindex(parentindices(x), axes(x)), axes(parent(x)), axes(a)
+    ) do index, original_axis, materialized_axis
+        offset = first(original_axis) - first(materialized_axis)
+        iszero(offset) ? index : index .- offset
+    end
+end
+
 function ReactantCore.materialize_traced_array(x::SubArray)
-    return materialize_traced_array(parent(x))[Base.reindex(parentindices(x), axes(x))...]
+    a = materialize_traced_array(parent(x))
+    return a[materialized_parent_indices(x, a)...]
 end
 
 function ReactantCore.materialize_traced_array(x::Base.ReshapedArray)
@@ -166,6 +178,15 @@ function set_mlir_data!(
     return x
 end
 
+function set_mlir_data!(x::SubArray{TracedRNumber{T}}, data) where {T}
+    # Write through the parent protocol so wrappers apply their inverse transformations.
+    px = parent(x)
+    a = @allowscalar promote_to(TracedRArray{T,ndims(px)}, materialize_traced_array(px))
+    @allowscalar setindex!(a, TracedRArray{T}(data), materialized_parent_indices(x, a)...)
+    set_mlir_data!(px, get_mlir_data(a))
+    return x
+end
+
 function set_mlir_data!(x::AnyTracedRArray{T}, data) where {T}
     ancestor, ancestor_indices = get_ancestor_and_indices(x, axes(x)...)
     setindex!(ancestor, TracedRArray{T}(data), ancestor_indices...)
@@ -206,9 +227,11 @@ function get_ancestor_and_indices_inner(
     return a, (idxs isa Tuple ? idxs : (idxs,))
 end
 function get_ancestor_and_indices_inner(
-    x::AnyTracedRArray{T,1}, linear_indices::AbstractArray
+    x::AnyTracedRArray{T,1}, indices::AbstractArray
 ) where {T}
-    a, idxs = _get_ancestor_and_indices_linear(x, linear_indices)
+    a, idxs = get_ancestor_and_indices(
+        parent(x), Base.reindex(parentindices(x), (indices,))...
+    )
     return a, (idxs isa Tuple ? idxs : (idxs,))
 end
 

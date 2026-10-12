@@ -1,53 +1,93 @@
-# How much of one of Reactant's own test files (`control_flow` by default, or
-# `autodiff`) passes with `@trace` on control flow made an identity macro and
-# every compilation routed through `structured`? Not part of the test suite:
-#     julia --project=lib/StructuredReactant/test lib/StructuredReactant/test/migration.jl [autodiff]
-using Reactant, StructuredReactant, Test
-using StructuredReactant: FrontendError
+# Run an upstream Reactant test file unchanged in an isolated process.
+# MIGRATION_MODE=vanilla: original frontend and annotations.
+# MIGRATION_MODE=structured: structured frontend, preserving annotations.
+# MIGRATION_MODE=automatic (default): also remove bare control-flow @trace.
+# MIGRATION_REPORT optionally writes a machine-readable TOML result.
+#     julia --project=... lib/StructuredReactant/test/migration.jl core/autodiff
+using Reactant, Test, TOML, SHA
+
+const MODE = get(ENV, "MIGRATION_MODE", "automatic")
+MODE in ("vanilla", "structured", "automatic") || error("unknown migration mode: $MODE")
+if MODE != "vanilla"
+    using StructuredReactant
+end
+Reactant.set_default_backend("cpu")
+
+const PACKAGE_PATHS = Dict("Reactant" => realpath(pkgdir(Reactant)))
+if MODE != "vanilla"
+    PACKAGE_PATHS["StructuredReactant"] = realpath(pkgdir(StructuredReactant))
+end
+for (name, path) in PACKAGE_PATHS
+    expected = get(ENV, "MIGRATION_EXPECT_" * uppercase(name), "")
+    isempty(expected) || path == realpath(expected) ||
+        error("loaded $name from $path, expected $expected")
+end
 
 const compile_calls = Ref(0)
 
-# Route user functions, callbacks included; leave Base and Reactant ones alone.
+# Use the frontend callback boundary, including stdlibs and package extensions.
 function route(f)
     f isa Base.Broadcast.BroadcastFunction &&
         return Base.Broadcast.BroadcastFunction(route(f.f))
-    f isa Function || return f
-    root = Base.moduleroot(parentmodule(typeof(f)))
-    root in (Base, Core, Reactant) && return f
-    return structured(f)
+    return StructuredReactant.structure_callback(f)
 end
 
 # The overrides are more specific than Reactant's methods (`args::Tuple`), so
 # `invoke` on the general signature reaches the originals in the current world.
-for entry in (:compile, :code_hlo, :code_mhlo, :code_xla)
+for entry in (MODE == "vanilla" ? () : (:compile, :code_hlo, :code_mhlo, :code_xla))
     @eval function Reactant.Compiler.$entry(ctx, f, args::Tuple; kwargs...)
         compile_calls[] += 1
+        if get(ENV, "MIGRATION_PROGRESS", "false") == "true"
+            println(
+                "compile ", compile_calls[], ": ", Test.get_testset().description, " / ", f
+            )
+            flush(stdout)
+        end
+        routed_args = map(route, args)
         result = Base.invoke(
             Reactant.Compiler.$entry,
             Tuple{Any,Any,Any},
             ctx,
             route(f),
-            map(route, args);
+            routed_args;
             kwargs...,
         )
         # A compiled function's signature holds the routed function-valued
         # arguments, so calls made with the bare functions are routed the same way.
-        return $(entry === :compile) ? (a...) -> result(map(route, a)...) : result
+        return if $(entry === :compile) && routed_args !== args
+            (a...) -> result(map(route, a)...)
+        else
+            result
+        end
     end
 end
 
-# A bare `@trace` on control flow becomes an identity; its options and the call
+# A bare `@trace` on control flow leaves its body to the frontend. Preserve the
+# macro's statement result (`nothing`), including for a terminal `if`: a plain
+# Julia `if` would instead return its selected branch's value. Options and call
 # outlining forms are hints the frontend does not replace, and are kept.
 const TRACE_WORLD = Base.get_world_counter()   # the original macro lives here
-@eval Reactant.ReactantCore macro trace(args...)
-    if length(args) == 1 && Meta.isexpr(only(args), (:if, :for, :while))
-        return esc(only(args))
+if MODE == "automatic"
+    @eval Reactant.ReactantCore macro trace(args...)
+        if length(args) == 1 && Meta.isexpr(only(args), (:if, :for, :while))
+            return quote
+                $(esc(only(args)))
+                nothing
+            end
+        end
+        return Base.invoke_in_world(
+            $TRACE_WORLD, var"@trace", __source__, __module__, args...
+        )
     end
-    return Base.invoke_in_world($TRACE_WORLD, var"@trace", __source__, __module__, args...)
 end
 
-file = isempty(ARGS) ? "control_flow" : only(ARGS)
-source = normpath(joinpath(@__DIR__, "..", "..", "..", "test", "core", file * ".jl"))
+file = isempty(ARGS) ? "core/control_flow" : only(ARGS)
+occursin('/', file) || (file = "core/" * file)
+endswith(file, ".jl") && (file = chop(file; tail=3))
+test_root = normpath(joinpath(@__DIR__, "..", "..", "..", "test"))
+source = normpath(joinpath(test_root, file * ".jl"))
+startswith(source, test_root * "/") || error("test file must be inside test/")
+isfile(source) || error("test file does not exist: $source")
 
 # Julia 1.13 keeps the active testset in a scoped value instead of a stack.
 function within(f, ts::Test.AbstractTestSet)
@@ -65,12 +105,28 @@ function within(f, ts::Test.AbstractTestSet)
     end
 end
 
-suite = Test.DefaultTestSet("Reactant $(file).jl through structured"; verbose=false)
+suite = Test.DefaultTestSet("Reactant $(file).jl ($MODE)"; verbose=false)
+load_error = Ref("")
 within(suite) do
     try
-        Base.include(Module(:Upstream), source)
+        selected = get(ENV, "MIGRATION_TESTSET", "")
+        function select_testset(expr)
+            if !isempty(selected) &&
+                Meta.isexpr(expr, :macrocall) &&
+                expr.args[1] === Symbol("@testset") &&
+                length(expr.args) >= 3 &&
+                expr.args[3] isa String &&
+                !occursin(selected, expr.args[3])
+                return nothing
+            end
+            return expr
+        end
+        upstream = Module(:Upstream)
+        Core.eval(upstream, :(using Test, Reactant)) # Match the upstream worker setup.
+        Base.include(select_testset, upstream, source)
     catch err
-        println("The file itself failed to load: ", sprint(showerror, err))
+        load_error[] = sprint(showerror, err, catch_backtrace())
+        println("The file itself failed to load: ", load_error[])
     end
 end
 
@@ -115,3 +171,25 @@ for (kind, n) in sort!(collect(counts); by=last, rev=true)
         println("       e.g. ", strip(testset, [' ', '/']))
     end
 end
+
+if !isempty(load_error[])
+    counts["load_error"] = 1
+end
+report = Dict(
+    "mode" => MODE,
+    "package_paths" => PACKAGE_PATHS,
+    "source" => source,
+    "source_sha256" => bytes2hex(sha256(read(source))),
+    "julia" => string(VERSION),
+    "compile_calls" => compile_calls[],
+    "testset_filter" => get(ENV, "MIGRATION_TESTSET", ""),
+    "counts" => counts,
+    "examples" => examples,
+    "load_error" => load_error[],
+)
+if haskey(ENV, "MIGRATION_REPORT")
+    open(ENV["MIGRATION_REPORT"], "w") do io
+        return TOML.print(io, report; sorted=true)
+    end
+end
+exit(any(kind != "pass" && kind != "broken" && n > 0 for (kind, n) in counts) ? 1 : 0)

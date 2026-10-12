@@ -288,3 +288,53 @@ end
     g(x) = all(broadcast(xj -> true, x))
     @test Bool(@jit g(x))
 end
+
+module MixedBroadcastResults
+struct MaybeHostBool
+    host::Bool
+end
+(f::MaybeHostBool)(x) = f.host ? true : x > 0
+struct MaybeHostFloat
+    host::Bool
+end
+(f::MaybeHostFloat)(x) = f.host ? 2.0f0 : x * x
+plain(f, x) = f.(x)
+fused(f, x) = identity.(f.(x))
+end
+
+@testset "Primitive and traced broadcast results" begin
+    for callback in (
+            MixedBroadcastResults.MaybeHostBool(false),
+            MixedBroadcastResults.MaybeHostBool(true),
+            MixedBroadcastResults.MaybeHostFloat(false),
+            MixedBroadcastResults.MaybeHostFloat(true),
+        ),
+        body in (MixedBroadcastResults.plain, MixedBroadcastResults.fused),
+        dims in ((2,), (1, 2), ())
+
+        @testset "$(typeof(callback)) host=$(callback.host) $(body) $dims" begin
+            x = dims == () ? fill(1.0f0) : reshape(Float32[-1, 2], dims)
+            compiled = Reactant.compile(body, (callback, Reactant.to_rarray(x)))
+            for input in (x, reshape(-2 .* vec(x), size(x)))
+                got = compiled(callback, Reactant.to_rarray(input))
+                expected = body(callback, input)
+                if dims == ()
+                    @test got[] == expected[]
+                else
+                    @test Array(got) == expected
+                end
+            end
+        end
+    end
+    # Empty shapes must infer the element type without sampling an element.
+    for callback in (
+            MixedBroadcastResults.MaybeHostBool(false),
+            MixedBroadcastResults.MaybeHostFloat(false),
+        ),
+        body in (MixedBroadcastResults.plain, MixedBroadcastResults.fused)
+
+        x = Reactant.to_rarray(Float32[])
+        ir = string(Reactant.@code_hlo optimize=false body(callback, x))
+        @test occursin("tensor<0x", ir)
+    end
+end

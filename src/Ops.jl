@@ -186,13 +186,13 @@ struct Token
     mlir_data::MLIR.IR.Value
 end
 
-const __TLSEntryBlockType = Tuple{MLIR.IR.Block,Dict{MLIR.IR.Attribute,TracedRArray}}
+const __TLSEntryBlockType = Tuple{MLIR.IR.Block,Dict{MLIR.IR.Attribute,MLIR.IR.Value}}
 
 function activate_constant_context!(blk::MLIR.IR.Block)
     stack = get!(task_local_storage(), :entry_block) do
         return __TLSEntryBlockType[]
     end::Vector{__TLSEntryBlockType}
-    Base.push!(stack, (blk, Dict{MLIR.IR.Attribute,TracedRArray}()))
+    Base.push!(stack, (blk, Dict{MLIR.IR.Attribute,MLIR.IR.Value}()))
     return nothing
 end
 
@@ -231,8 +231,8 @@ end
     constant_blk, constants = constant_context()
     parent = MLIR.IR.parent_op(constant_blk)
     @assert MLIR.IR.name(parent) != "builtin.module"
-    if haskey(constants, value)
-        return constants[value]
+    res = if haskey(constants, value)
+        constants[value]
     else
         output = mlir_type(TracedRArray{T,N}, size(x))
 
@@ -253,11 +253,11 @@ end
             result_inference=false,
         )
 
-        res = MLIR.IR.result(cstop)
-        tres = TracedRArray{T,N}((), res, size(x))
-        constants[value] = tres
-        return tres
+        constants[value] = MLIR.IR.result(cstop)
     end
+    # Deduplicate the SSA value, while giving each array its own mutable handle.
+    # Rebinding one result must not change subsequent reads of the constant.
+    return TracedRArray{T,N}((), res, size(x))
 end
 
 @noinline function constant(
@@ -303,10 +303,10 @@ end
 function fill(
     v, dims::NTuple{N,Integer}; location=mlir_stacktrace("fill", @__FILE__, @__LINE__)
 ) where {N}
-    return fill(v, collect(Int64, dims); location)
+    return fill(v, collect(Int64, dims); location)::TracedRArray{<:Any,N}
 end
 function fill(v, ::Tuple{}; location=mlir_stacktrace("fill", @__FILE__, @__LINE__))
-    return fill(v, Int[]; location)
+    return fill(v, Int[]; location)::TracedRArray{<:Any,0}
 end
 
 function fill(

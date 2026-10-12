@@ -1479,7 +1479,13 @@ Base.@nospecializeinfer function make_tracer(
         throw("Cannot trace existing trace type")
     end
     if mode == TracedToTypes
-        push!(path, MLIR.IR.type(prev.mlir_data))
+        push!(path, Ops.mlir_type(prev))
+        # Callees receive one MLIR argument per distinct tracer. Preserve the
+        # alias pattern in the cache key, using traversal-local identities.
+        identity = get!(seen, prev) do
+            VisitedObject(length(seen) + 1)
+        end
+        push!(path, identity)
         return nothing
     end
     if mode == TracedTrack
@@ -1568,7 +1574,13 @@ Base.@nospecializeinfer function make_tracer(
         throw("Cannot trace existing trace type")
     end
     if mode == TracedToTypes
-        push!(path, MLIR.IR.type(prev.mlir_data))
+        push!(path, Ops.mlir_type(prev))
+        # Callees receive one MLIR argument per distinct tracer. Preserve the
+        # alias pattern in the cache key, using traversal-local identities.
+        identity = get!(seen, prev) do
+            VisitedObject(length(seen) + 1)
+        end
+        push!(path, identity)
         return nothing
     end
     if mode == TracedTrack

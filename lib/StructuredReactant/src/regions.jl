@@ -116,7 +116,26 @@ function Reactant.call_with_reactant(r::Region, values...)
         r.other[] = result
         return result
     end
+    check_branch_results(fr, result, r.other[])
     return fill_dead_slots(result, r.other[], r.result_type)
+end
+
+# A branch result must have the same runtime structure on either path. Letting
+# a missing result reach Reactant's builder can produce a MethodError holding
+# an MLIR value that is no longer safe to print after the context is destroyed.
+function check_branch_results(fr::Frame, @nospecialize(values), @nospecialize(other))
+    if (values === nothing && has_traced(other)) ||
+        (other === nothing && has_traced(values))
+        unsupported(
+            fr, "branches returning `nothing` on one path and a traced value on another"
+        )
+    elseif values isa Union{Tuple,NamedTuple} && other isa Union{Tuple,NamedTuple}
+        nfields(values) == nfields(other) || return nothing
+        for i in 1:nfields(values)
+            check_branch_results(fr, getfield(values, i), getfield(other, i))
+        end
+    end
+    return nothing
 end
 
 # A multiplexed exit leaves `undef` in slots a path does not define; one Reactant
@@ -201,10 +220,12 @@ function emit_loop(fr::Frame, op::ForOp)
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
         unrolled = Unrolled(fr)
         body_frame = fork(fr; exits=false)
+        captured = captured_array_state(fr, op)
         while lower < upper && (
             unassigned(carries) ||
-            !tuple_any(has_traced, carries) ||
-            !tuple_all(rollable, carries)
+            (!tuple_any(has_traced, carries) && !mutated(captured)) ||
+            !tuple_all(rollable, carries) ||
+            aliased_carries(fr, op, carries)
         )
             bind!(fr, op.iv_arg, lower)
             carries = iteration(fr, op.body, carries, body_frame)
@@ -215,6 +236,7 @@ function emit_loop(fr::Frame, op::ForOp)
     end
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
+    check_carry_aliases(fr, op, carries)
     return roll_for(fr, op, lower, upper, step, tuple_map(v -> carry(fr, v), carries))
 end
 
@@ -222,7 +244,11 @@ end
 # iteration count, which Enzyme's reverse pass recognizes and indexes caches by.
 function roll_for(fr::Frame, op::ForOp, lower, upper, step, @nospecialize(carries::Tuple))
     T = lower isa Number ? typeof(lower) : Reactant.unwrapped_eltype(lower)
-    count = traced(÷)(traced(-)(traced(+)(upper, step), lower + one(T)), step)
+    count = if lower isa Integer && upper isa Integer && step isa Integer
+        cld(upper - lower, step)
+    else
+        traced(÷)(traced(-)(traced(+)(upper, step), lower + one(T)), step)
+    end
     keys, invariants = traced_captures(fr, captures(op, Any[op.step], nothing))
     # First induction value and iteration count, as invariants.
     push!(keys, Bound(), Bound())
@@ -230,7 +256,12 @@ function roll_for(fr::Frame, op::ForOp, lower, upper, step, @nospecialize(carrie
     carries = (Ops.constant(zero(T)), carries...)
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, length(invariants), 0) begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
+            LoopCondition(),
+            LoopBody(),
+            carries,
+            invariants;
+            track_numbers=Union{},
+            checkpointing=loop_checkpointing(count),
         )
     end
     return Base.tail(carries)
@@ -241,20 +272,32 @@ function emit_loop(fr::Frame, op::WhileOp)
     carries = operands(fr, op.init_values)
     unrolled = Unrolled(fr)
     body_frame = fork(fr; exits=false)
+    captured = captured_array_state(fr, op)
+    local outcome
     while true
         bind!(fr, op.before.args, carries)
         outcome = emit_block(fr, op.before)
         outcome isa Conditioned || unsupported(fr, "a loop condition that does not yield")
-        outcome.condition isa Bool &&
-        (!tuple_any(has_traced, outcome.values) || !tuple_all(rollable, outcome.values)) ||
-            break
-        outcome.condition || return outcome.values
+        outcome.condition === false && return outcome.values
+        outcome.condition isa Bool && (
+            (!tuple_any(has_traced, outcome.values) && !mutated(captured)) ||
+            !tuple_all(rollable, outcome.values)
+        ) || break
         carries = iteration(fr, op.after, outcome.values, body_frame)
         count!(unrolled)
     end
-    unassigned(carries) &&
+    outcome.condition isa Union{Bool,TracedRNumber{Bool}} ||
+        unsupported(fr, "a loop condition of type $(typeof(outcome.condition))")
+    unassigned(outcome.values) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
-    return roll(fr, op, tuple_map(v -> carry(fr, v), carries))
+    check_carry_aliases(fr, op, outcome.values)
+    # The condition has already run, including its mutations. Carry its result
+    # and the values it forwards; the body computes the next condition once.
+    return roll(
+        fr,
+        op,
+        (carry(fr, outcome.condition), tuple_map(v -> carry(fr, v), outcome.values)...),
+    )
 end
 
 function unassigned(@nospecialize(carries::Tuple))
@@ -298,6 +341,7 @@ function emit_loop(fr::Frame, op::LoopOp)
     k = counted_range(fr, op)
     k != 0 && carries[k] isa Iteration && return roll_counted(fr, op, k, carries)
     host = iterates_host_collection(fr, op)
+    captured = captured_array_state(fr, op)
     unrolled = Unrolled(fr)
     body_frame = fork(fr; exits=true)
     local done
@@ -305,10 +349,14 @@ function emit_loop(fr::Frame, op::LoopOp)
         done, carries... = iteration_of_general_loop(fr, op.body, carries, body_frame)
         done isa Bool || break
         done && return carries
-        !host && tuple_any(has_traced, carries) && tuple_all(rollable, carries) && break
+        !host &&
+            (tuple_any(has_traced, carries) || mutated(captured)) &&
+            tuple_all(rollable, carries) &&
+            break
         count!(unrolled)
     end
     # The last decision may already be traced: the rolled loop starts from it.
+    check_carry_aliases(fr, op, carries)
     return roll(fr, op, (carry(fr, done), tuple_map(v -> carry(fr, v), carries)...))
 end
 
@@ -327,15 +375,18 @@ function roll(fr::Frame, op::Union{WhileOp,LoopOp}, @nospecialize(carries::Tuple
     keys, invariants = traced_captures(fr, captures(op, Any[], nothing))
     Base.ScopedValues.@with CURRENT_LOOP => Loop(fr, op, keys, 0, 0) begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
+            LoopCondition(),
+            LoopBody(),
+            carries,
+            invariants;
+            track_numbers=Union{},
+            checkpointing=loop_checkpointing(),
         )
     end
 
-    op isa LoopOp && return Base.tail(carries)  # drop the done flag
-    # A while loop's results are the values its condition region forwards on exit.
-    exit = fork(fr)
-    bind!(exit, op.before.args, carries)
-    return (emit_block(exit, op.before)::Conditioned).values
+    # Drop the general loop's done flag or the while loop's condition. The
+    # latter already carries the values forwarded by its final condition.
+    return Base.tail(carries)
 end
 
 function Reactant.call_with_reactant(::LoopCondition, carries, invariants)
@@ -350,22 +401,21 @@ function emit_loop_region(loop::Loop, role::Symbol, carries, invariants)
     role === :condition &&
         loop.bound != 0 &&
         return traced(<)(carries[1], invariants[loop.bound])
+    role === :condition && loop.op isa WhileOp && return carries[1]
     # Not the enclosing body's `exits`: this loop's `continue` yields carries.
     fr = fork(loop.frame; exits=false)
     bind!(fr, loop.keys, invariants)
     op = loop.op
     if op isa WhileOp
-        bind!(fr, op.before.args, carries)
+        # Rotate the source while: its StableHLO condition only reads a Boolean.
+        # All user condition work belongs here, where mutations are returned by
+        # the loop builder, and in the initial condition emitted before rolling.
+        bind!(fr, op.after.args, Base.tail(carries))
+        next = (emit_block(fr, op.after)::Yielded).values
+        bind!(fr, op.before.args, next)
         outcome = emit_block(fr, op.before)
         outcome isa Conditioned || unsupported(fr, "a loop condition that does not yield")
-        if role === :condition
-            outcome.condition isa TracedRNumber{Bool} ||
-                unsupported(fr, "a loop condition of type $(typeof(outcome.condition))")
-            return outcome.condition
-        end
-        bind!(fr, op.after.args, outcome.values)
-        next = (emit_block(fr, op.after)::Yielded).values
-        update!(fr, carries, next)
+        update!(fr, carries, (outcome.condition, outcome.values...))
     elseif op isa LoopOp && loop.counted != 0
         counter, rest = carries[1], Base.tail(carries)
         next = continued(fr, op, rest)
@@ -446,13 +496,105 @@ end
 rollable(@nospecialize(x::Union{Tuple,NamedTuple})) = tuple_all(rollable, x)
 rollable(::MissingTracedValue) = false
 
-function update!(
-    fr::Frame, @nospecialize(carries::Union{Tuple,NamedTuple}), @nospecialize(next)
+# Mutation through a capture is loop-carried device state too. Observe one
+# host iteration before rolling, so merely reading shapes or host tables does
+# not turn their construction into device work. The observed iteration remains
+# in the program; the loop starts at the next induction value.
+function captured_array_state(fr::Frame, op::ControlFlowOp)
+    arrays = TracedRArray[]
+    seen = Base.IdSet{Any}()
+    for key in captures(op, Any[], nothing)
+        value = operand(fr, key)
+        # A host container may be read or mutated by the body. Its operations
+        # must keep their host indices and execute on every host iteration.
+        has_host_mutable(value) && return nothing
+        has_traced(value) && array_leaves!(arrays, value, seen)
+    end
+    return Tuple{TracedRArray,Reactant.MLIR.IR.Value}[(a, a.mlir_data) for a in arrays]
+end
+function has_host_mutable(@nospecialize(x))
+    x isa Union{TracedType,Number,Type,Module,Symbol,String} && return false
+    T = typeof(x)
+    ismutabletype(T) && return true
+    for i in 1:fieldcount(T)
+        isdefined(x, i) && has_host_mutable(getfield(x, i)) && return true
+    end
+    return false
+end
+mutated(::Nothing) = false
+function mutated(state::Vector{Tuple{TracedRArray,Reactant.MLIR.IR.Value}})
+    for (array, before) in state
+        array.mlir_data != before && return true
+    end
+    return false
+end
+
+# A carried array is copied into a loop argument. If another name still
+# aliases it, splitting that identity before the first iteration loses shared
+# mutations. Execute host-controlled iterations until the bindings separate.
+function aliased_carries(fr::Frame, op::ControlFlowOp, @nospecialize(carries))
+    arrays = TracedRArray[]
+    array_leaves!(arrays, carries, Base.IdSet{Any}())
+    isempty(arrays) && return false
+    carried = Base.IdSet{Any}(arrays)
+    empty!(arrays)
+    seen = Base.IdSet{Any}()
+    for key in captures(op, Any[], nothing)
+        array_leaves!(arrays, operand(fr, key), seen)
+    end
+    return any(in(carried), arrays)
+end
+
+function array_leaves!(arrays, @nospecialize(x), seen)
+    if x isa TracedRArray
+        push!(arrays, x)
+        return nothing
+    end
+    x isa Union{TracedRNumber,Type,Module,Symbol,String} && return nothing
+    T = typeof(x)
+    isprimitivetype(T) && return nothing
+    if ismutabletype(T)
+        x in seen && return nothing
+        push!(seen, x)
+    end
+    if x isa Array
+        isbitstype(eltype(x)) && return nothing
+        for i in eachindex(x)
+            isassigned(x, i) && array_leaves!(arrays, x[i], seen)
+        end
+    else
+        for i in 1:fieldcount(T)
+            isdefined(x, i) && array_leaves!(arrays, getfield(x, i), seen)
+        end
+    end
+    return nothing
+end
+
+function check_carry_aliases(fr::Frame, op::ControlFlowOp, @nospecialize(carries))
+    aliased_carries(fr, op, carries) && unsupported(
+        fr, "a loop-carried array that aliases another carried or captured value"
+    )
+    return nothing
+end
+
+# Loop carries are assigned simultaneously: a next value can refer to another
+# carry whose tracer will be overwritten. Capture all MLIR values before writing.
+function update!(fr::Frame, @nospecialize(carries), @nospecialize(next))
+    updates = Tuple{TracedType,Reactant.MLIR.IR.Value}[]
+    collect_updates!(updates, fr, carries, next)
+    for (value, data) in updates
+        Reactant.TracedUtils.set_mlir_data!(value, data)
+    end
+    return nothing
+end
+
+function collect_updates!(
+    updates, fr::Frame, @nospecialize(carries::Union{Tuple,NamedTuple}), @nospecialize(next)
 )
     next isa Union{Tuple,NamedTuple} && nfields(carries) == nfields(next) ||
         unsupported(fr, "a loop that changes how many values it carries")
     for i in 1:nfields(carries)
-        update!(fr, getfield(carries, i), getfield(next, i))
+        collect_updates!(updates, fr, getfield(carries, i), getfield(next, i))
     end
     return nothing
 end
@@ -461,24 +603,24 @@ end
 # also promote the shape metadata of array wrappers among the captures; a host
 # number yielded by a branch is promoted here so that both branches agree.
 regionvalue(@nospecialize(x)) = x isa Number ? Ops.constant(x) : x
-function update!(fr::Frame, c::Iteration, next)
+function collect_updates!(updates, fr::Frame, c::Iteration, next)
     next isa Iteration || unsupported(fr, "a loop-carried range iterator that changes type")
-    update!(fr, c.i, next.i)
-    return update!(fr, c.stop, next.stop)
+    collect_updates!(updates, fr, c.i, next.i)
+    return collect_updates!(updates, fr, c.stop, next.stop)
 end
-function update!(fr::Frame, c::TracedType, @nospecialize(next))
+function collect_updates!(updates, fr::Frame, c::TracedType, @nospecialize(next))
     next isa Number && (next = Ops.constant(next))
     next isa TracedType || unsupported(
         fr, "a loop-carried value that changes from $(typeof(c)) to $(typeof(next))"
     )
     Reactant.MLIR.IR.type(c.mlir_data) == Reactant.MLIR.IR.type(next.mlir_data) ||
         unsupported(fr, "a loop-carried value that changes type or shape")
-    Reactant.TracedUtils.set_mlir_data!(c, next.mlir_data)
+    push!(updates, (c, next.mlir_data))
     return nothing
 end
 # A struct is updated field by field; a host value it carries as it is must not
 # have changed.
-function update!(fr::Frame, @nospecialize(c), @nospecialize(next))
+function collect_updates!(updates, fr::Frame, @nospecialize(c), @nospecialize(next))
     T = typeof(c)
     if !isstructtype(T) || c isa Number || fieldcount(T) == 0
         c === next && return nothing
@@ -489,7 +631,7 @@ function update!(fr::Frame, @nospecialize(c), @nospecialize(next))
     for i in 1:fieldcount(T)
         isdefined(c, i) && isdefined(next, i) ||
             unsupported(fr, "a loop-carried value with an undefined field")
-        update!(fr, getfield(c, i), getfield(next, i))
+        collect_updates!(updates, fr, getfield(c, i), getfield(next, i))
     end
     return nothing
 end
@@ -596,6 +738,13 @@ function roll_counted(fr::Frame, op::LoopOp, k::Int, @nospecialize(carries::Tupl
     carries = continued(fr, op, carries)
     unassigned(carries) &&
         unsupported(fr, "reading a value after a loop that is only assigned inside it")
+    check_carry_aliases(fr, op, carries)
+    initial = carries[k]::Iteration
+    static_count = if initial.i isa Integer && initial.stop isa Integer
+        initial.stop - initial.i + 1
+    else
+        nothing
+    end
     carries = tuple_map(v -> carry(fr, v), carries)
     it = carries[k]::Iteration
     T = unwrapped(it.i)
@@ -607,7 +756,14 @@ function roll_counted(fr::Frame, op::LoopOp, k::Int, @nospecialize(carries::Tupl
     scope = Loop(fr, op, keys, length(invariants), k + 1)
     Base.ScopedValues.@with CURRENT_LOOP => scope begin
         Ops.while_loop(
-            LoopCondition(), LoopBody(), carries, invariants; track_numbers=Union{}
+            LoopCondition(),
+            LoopBody(),
+            carries,
+            invariants;
+            track_numbers=Union{},
+            checkpointing=loop_checkpointing(
+                static_count === nothing ? last(invariants) : static_count
+            ),
         )
     end
     return Base.tail(carries)

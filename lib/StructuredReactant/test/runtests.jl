@@ -463,17 +463,18 @@ end
 
         # Host iterations that emit operations are counted; past the threshold
         # the loop is reported once, with the `@trace` hint that rolls it.
-        function stamp_all!(x)
+        function collect_emissions(x)
+            outputs = typeof(x)[]
             for i in 1:4
-                @allowscalar x[i] = x[i] * 2.0f0
+                push!(outputs, x .* Float32(i))
             end
-            return x
+            return outputs
         end
         threshold = StructuredReactant.UNROLL_WARNING[]
         StructuredReactant.UNROLL_WARNING[] = 2
         try
             @test_logs (:warn, r"unrolled") match_mode = :any Reactant.@compile structured(
-                stamp_all!
+                collect_emissions
             )(
                 R(Float32[1, 2, 3, 4])
             )
@@ -606,6 +607,9 @@ end
         b = Float32[0.5 1.5 2.5; 3.5 4.5 5.5]
         Reactant.@jit structured(stamp_grid!)(grid, R(a), R(b))
         @test host(grid) ≈ a .+ b
+        @test occursin(
+            "stablehlo.while", unoptimized(stamp_grid!, zeros(Float32, 2, 3), a, b)
+        )
         @test !occursin("stablehlo.while", hlo(stamp_grid!, zeros(Float32, 2, 3), a, b))
         # A handler that would only run on a trace-time exception is dropped.
         function protected(x)
@@ -955,7 +959,43 @@ end
             e
         end
         @test occursin("checked", sprint(showerror, err))
+
+        function optional_value(c, n)
+            if c
+                1.0
+            elseif n == 4
+                2.0
+            end
+        end
+        err = try
+            Reactant.compile(structured(optional_value), (R(true), R(4)))
+            nothing
+        catch e
+            e
+        end
+        # Never ask Test to print a foreign MLIR-backed exception after teardown.
+        @test typeof(err) === FrontendError
+        if err isa FrontendError
+            @test occursin("branches returning `nothing`", sprint(showerror, err))
+        end
+        valid(c, x) = c ? x .+ 1 : x .- 1
+        compiled = Reactant.compile(structured(valid), (R(true), R(Float32[2, 3])))
+        @test Array(compiled(R(true), R(Float32[2, 3]))) == Float32[3, 4]
+        @test Array(compiled(R(false), R(Float32[2, 3]))) == Float32[1, 2]
     end
 end
 
 include("cache.jl")
+
+include("while_conditions.jl")
+include("recurrence.jl")
+
+include("checkpointing.jl")
+
+include("mutation_loops.jl")
+
+include("differentiation.jl")
+
+include("native_calls.jl")
+
+include("recovery.jl")

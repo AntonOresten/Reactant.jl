@@ -1297,6 +1297,19 @@ fn_test_wrap(x) = Reactant.Ops.wrap(x, 2, 1; dimension=3)
 end
 
 @testset "Ops.fill" begin
+    @testset "Tuple dimensions preserve rank" begin
+        for T in (Float32, Int32), dims in ((), (3,), (2, 3), (Base.OneTo(2), Base.OneTo(3)))
+            N = length(dims)
+            for V in (T, Reactant.TracedRNumber{T})
+                rt = Core.Compiler.return_type(Ops.fill, Tuple{V,typeof(dims)})
+                @test rt <: Reactant.TracedRArray{T,N}
+            end
+            fn(v) = Ops.fill(v, dims)
+            result = @jit fn(ConcreteRNumber(T(2)))
+            @test result isa ConcreteRArray{T,N}
+            @test Array(result) == fill(T(2), map(Base.to_dim, dims))
+        end
+    end
     @testset "Fill with TracedScalar" begin
         fn(x) = Ops.fill(x, [2, 3])
         x_ra = ConcreteRNumber(1.0f0)

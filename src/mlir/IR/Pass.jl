@@ -55,9 +55,15 @@ function enable_ir_printing!(
     after_only_on_change=false,
     after_only_on_failure=false,
 )
-    API.mlirPassManagerEnableIRPrinting(
-        pm, before_all, after_all, module_scope, after_only_on_change, after_only_on_failure
-    )
+    flags = API.mlirOpPrintingFlagsCreate()
+    try
+        API.mlirPassManagerEnableIRPrinting(
+            pm, before_all, after_all, module_scope, after_only_on_change,
+            after_only_on_failure, flags, "",
+        )
+    finally
+        API.mlirOpPrintingFlagsDestroy(flags)
+    end
     return pm
 end
 

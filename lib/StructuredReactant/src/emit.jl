@@ -425,7 +425,20 @@ const EMISSIONS = Ref(0)
 
 function leaf(@nospecialize(f), args::Vector{Any})
     EMISSIONS[] += 1
-    return Reactant.call_with_reactant(f, map_arguments(structure_callback, args)...)
+    # The callee of an explicit native escape must not become a callback.
+    if f === Reactant.call_with_native ||
+        (f === Core.kwcall && args[2] === Reactant.call_with_native)
+        return f(args...)
+    end
+    values = map_arguments(structure_callback, args)
+    if f === Core.kwcall
+        # kwcall's second operand is the callee, not a callback. Wrapping it
+        # would re-enter this same native method indefinitely.
+        values[2] = args[2]
+        kwargs = args[1]::NamedTuple
+        values[1] = NamedTuple{keys(kwargs)}(tuple_map(structure_callback, kwargs))
+    end
+    return Reactant.call_with_reactant(f, values...)
 end
 
 # Dispatch on the runtime argument types: a leaf is called through Reactant with
@@ -468,7 +481,7 @@ function structure_callback(@nospecialize(x))
     x isa Function || return x
     x isa Program && return x
     root = Base.moduleroot(parentmodule(typeof(x)))
-    (root in LEAF_ROOTS || isstdlib(root)) && return x
+    (owns_native_methods(root) || isstdlib(root)) && return x
     return structured(x)
 end
 

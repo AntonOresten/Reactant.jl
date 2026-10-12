@@ -1,7 +1,8 @@
 module ReactantOffsetArraysExt
 
 using OffsetArrays: OffsetArrays, OffsetArray, OffsetVector
-using Reactant: Reactant, MLIR, Ops, TracedRArray, TracedRNumber, AbstractConcreteArray
+using Reactant: Reactant, TracedRNumber, AbstractConcreteArray
+using ReactantCore: ReactantCore
 
 Base.@nospecializeinfer function Reactant.traced_type_inner(
     @nospecialize(OA::Type{<:OffsetArray}),
@@ -69,6 +70,17 @@ function Reactant.TracedUtils.get_ancestor_and_indices_inner(
     return Reactant.TracedUtils.get_ancestor_and_indices(
         parent(x), map(parentindex, axes(x), indices)...
     )
+end
+
+function ReactantCore.materialize_traced_array(x::OffsetArray{<:TracedRNumber})
+    return ReactantCore.materialize_traced_array(parent(x))
+end
+
+# Offsets relabel axes without changing the stored elements. Preserve the
+# parent's writeback protocol, including transpose and adjoint transformations.
+function Reactant.TracedUtils.set_mlir_data!(x::OffsetArray{<:TracedRNumber}, data)
+    Reactant.TracedUtils.set_mlir_data!(parent(x), data)
+    return x
 end
 
 end

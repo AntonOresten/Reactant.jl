@@ -77,6 +77,11 @@ emits operations, such as a scalar-indexed kernel, is unrolled into the
 program; past `UNROLL_WARNING[]` such iterations (256) a warning says so once
 and points at `@trace for`, which rolls a loop regardless.
 
+A `while` condition runs once before the loop and once after each body iteration.
+Its Boolean result is carried through the loop, so condition mutations are
+preserved even when the body runs zero times. Loop-carried values are updated
+simultaneously, preserving the previous iteration's values in recurrences.
+
 Because loop carries and induction variables become traced only at emission,
 a traced number stands in for its element type: intrinsics on it map to the
 `Base` operation Julia's own method computes, and objects whose type inference
@@ -114,13 +119,27 @@ recursion on traced values, a branch on a traced condition that always throws,
 `===` on traced floating-point values, and anything IRStructurizer cannot
 structure. Releases up to 0.6.4 cannot structure a `for` nested directly in a
 `for` and mis-promote loops over opaque ranges such as `eachindex(x)`; both are
-fixed upstream (maleadt/IRStructurizer.jl#61 and #62), and until the next
-release the package works around the second and skips the first. Calls whose
+fixed upstream (maleadt/IRStructurizer.jl#61 and #62). The package detects the
+hoisting implementation on main without changing its version; older releases
+still use the range workaround and skip the nested-loop checks. The expanded
+compatibility suite currently requires upstream main. Calls whose
 arguments carry no traced values run as ordinary Julia, so host-side work is
 unaffected. Base functions applied to
 traced values behave exactly as under Reactant today, including where that
-fails. Reverse-mode differentiation through a data-dependent `while` still
-needs the checkpointing hints that only `@trace` can express.
+fails. Runtime-counted loops use binomial checkpointing automatically for reverse
+mode. Statically counted loops retain their existing caching behavior. Configure
+the strategy at the entry point with `structured(f; checkpointing=...)`: `false`,
+`true`, `:auto` (the default), `Reactant.Periodic(n)`, or `Reactant.Binomial(n)`.
+The option applies to nested structured calls and callbacks; an explicitly
+configured nested wrapper overrides it. Binomial budgets must be at least two.
+Explicit `@trace` options keep their existing meaning.
+
+The native backend's checkpointing implementation currently requires a canonical
+counted loop. Reverse mode through a general data-dependent `while` remains
+unsupported even with an explicit strategy; adding a checkpointing hint alone
+does not solve that native limitation. The ongoing
+[compatibility and differentiation audit](test/compatibility.md) records the
+coverage and remaining work.
 
 A variable that a closure reassigns but that also lives in an enclosing scope is
 boxed by Julia, and its "possibly undefined" paths surface as throwing branches
@@ -137,6 +156,9 @@ macro, routes every compilation through `structured`, and runs one of
 Reactant's own test files unchanged, `test/core/control_flow.jl` by default or
 `autodiff` when named as an argument, reporting what passes and why the rest
 does not.
+
+The [control-flow comparison](test/comparison.md) documents the pinned Polybench
+corpus, reference checks, and the condition-mutation and recurrence regressions.
 
 Requires Julia 1.11, 1.12 or 1.13. The compiler interfaces that changed in
 1.12 (`Future`s, `MethodCallResult`, and the inlining hook) are gated in

@@ -35,20 +35,45 @@ CC.may_discard_trees(::Interpreter) = false
 
 # A leaf is called through `Reactant.call_with_reactant`, never emitted from IR.
 function isleaf(method::Method, @nospecialize(sig))
+    # An explicit structured wrapper establishes a tracing scope. Inlining its
+    # ordinary-Julia fallback would discard options such as checkpointing.
+    program_signature(sig) && return true
     if isdefined(method, :external_mt)
         method.external_mt === Reactant.REACTANT_METHOD_TABLE && return true
     end
     root = Base.moduleroot(method.module)
-    root in LEAF_ROOTS && return true
+    owns_native_methods(root) && return true
     return isstdlib(root) && involves_reactant(sig)
+end
+
+function program_signature(@nospecialize(sig))
+    sig = Base.unwrap_unionall(sig)
+    sig isa DataType || return false
+    types = sig.parameters
+    return types[1] <: Program ||
+           (types[1] === typeof(Core.kwcall) && length(types) >= 3 && types[3] <: Program)
 end
 
 const LEAF_ROOTS = Module[Reactant, ReactantCore, Reactant.Enzyme, Reactant.EnzymeCore]
 
+# Extensions define methods in separate root modules. Use Julia's ownership
+# metadata, so a package's native boundary includes its optional integrations
+# without depending on extension names or maintaining a list of packages.
+function owns_native_methods(root::Module)
+    root in LEAF_ROOTS && return true
+    for parent in LEAF_ROOTS
+        Base.get_extension(parent, nameof(root)) === root && return true
+    end
+    return false
+end
+
 function isstdlib(root::Module)
     (root === Base || root === Core) && return true
     path = pathof(root)
-    return path !== nothing && startswith(path, Sys.STDLIB)
+    path !== nothing && startswith(path, Sys.STDLIB) && return true
+    # Updatable stdlibs may be loaded from a depot instead of Sys.STDLIB.
+    pkgid = Base.PkgId(root)
+    return pkgid.uuid !== nothing && Base.is_stdlib(pkgid)
 end
 
 function involves_reactant(@nospecialize(T))
@@ -64,10 +89,11 @@ function involves_reactant(@nospecialize(T))
     return false
 end
 
-# Keep host loops out of traced callers: otherwise bulk host work becomes one
-# interpreted statement at a time. Small host helpers still inline, including
-# iteration primitives whose state may become traced when their caller rolls a
-# loop. Sources stay uncompressed so the policy can inspect their control flow.
+# Keep host loops and error paths out of traced callers: bulk host work would
+# otherwise run one interpreted statement at a time, and host errors can become
+# traced loop exits. Small host helpers still inline, including iteration
+# primitives whose state can become traced when their caller rolls a loop.
+# Sources stay uncompressed so the policy can inspect their control flow.
 CC.may_compress(::Interpreter) = false
 
 function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
@@ -75,7 +101,8 @@ function stays_out_of_line(@nospecialize(src), @nospecialize(info::CC.CallInfo))
     src isa CC.OptimizationState && (src = src.src)
     return any_call_match(leaf_match, info) ||
            opaque_to_emitter(src) ||
-           (contains_loop(src) && any_call_match(host_match, info))
+           ((contains_loop(src) || contains_unreachable(src)) &&
+            any_call_match(host_match, info))
 end
 
 # Julia 1.12 turned `inlining_policy`, which returns the source to inline or
@@ -119,6 +146,20 @@ function opaque_to_emitter(@nospecialize(src))
     end
 end
 
+# Keep a host helper's error path inside the native call. Structurization can
+# otherwise hoist that path out of an enclosing traced loop and carry its exit
+# tag as a traced value, even when the host condition is known while tracing.
+function contains_unreachable(@nospecialize(src))
+    stmts = if src isa Core.CodeInfo
+        src.code
+    elseif src isa CC.IRCode
+        src.stmts.stmt
+    else
+        return false
+    end
+    return any(stmt -> stmt isa Core.ReturnNode && !isdefined(stmt, :val), stmts)
+end
+
 function contains_loop(@nospecialize(src))
     if src isa Core.CodeInfo
         for (i, stmt) in enumerate(src.code)
@@ -157,7 +198,39 @@ else
     union_split(info::CC.UnionSplitInfo) = info.matches
 end
 
-# Type a leaf with Reactant's interpreter and stop there.
+# Preserve native inference for constant arguments as well as type-only calls.
+# Re-entering a native leaf with this interpreter would lose native escapes.
+function CC.abstract_call_method_with_const_args(
+    interp::Interpreter,
+    result::CC.MethodCallResult,
+    @nospecialize(f),
+    arginfo::CC.ArgInfo,
+    si::CC.StmtInfo,
+    match::Core.MethodMatch,
+    sv::CC.AbsIntState,
+    invokecall::Union{Nothing,CC.InvokeCall}=nothing,
+)
+    if isleaf(match.method, match.spec_types)
+        native = leaf_interpreter(match.spec_types, interp.world)
+        if native isa CC.NativeInterpreter
+            return CC.abstract_call_method_with_const_args(
+                native, result, f, arginfo, si, match, sv, invokecall
+            )
+        end
+    end
+    return @invoke CC.abstract_call_method_with_const_args(
+        interp::CC.AbstractInterpreter,
+        result::CC.MethodCallResult,
+        f::Any,
+        arginfo::CC.ArgInfo,
+        si::CC.StmtInfo,
+        match::Core.MethodMatch,
+        sv::CC.AbsIntState,
+        invokecall::Union{Nothing,CC.InvokeCall},
+    )
+end
+
+# Type a leaf with the interpreter that will execute it.
 function CC.abstract_call_method(
     interp::Interpreter,
     method::Method,
@@ -205,7 +278,38 @@ end
 function leaf_return_type(@nospecialize(sig), world::UInt)
     sig = Base.unwrap_unionall(sig)
     sig isa DataType || return Any
-    return CC._return_type(Reactant.ReactantInterpreter(; world), sig)
+    return inferred_return_type(leaf_interpreter(sig, world), sig)
+end
+
+function leaf_interpreter(@nospecialize(sig), world::UInt)
+    sig = Base.unwrap_unionall(sig)
+    ft = sig.parameters[1]
+    if ft === typeof(Core.kwcall) && length(sig.parameters) >= 3
+        ft = sig.parameters[3]
+    end
+    return if Reactant.should_rewrite_call(ft)
+        Reactant.ReactantInterpreter(; world)
+    else
+        CC.NativeInterpreter(world)
+    end
+end
+
+# CC._return_type looks up its root in Julia's ordinary method table, even with
+# a custom interpreter. Select through the interpreter's table so root overlays
+# agree with the native call that emission will execute.
+function inferred_return_type(interp::CC.AbstractInterpreter, sig::DataType)
+    CC.singleton_type(sig.parameters[1]) isa Core.Builtin &&
+        return CC._return_type(interp, sig)
+    matches = CC.findall(sig, CC.method_table(interp); limit=-1)
+    matches === nothing && return Any
+    rt = Union{}
+    for match in matches.matches
+        ty = CC.typeinf_type(interp, match.method, match.spec_types, match.sparams)
+        ty === nothing && return Any
+        rt = CC.tmerge(rt, ty)
+        rt === Any && break
+    end
+    return rt
 end
 
 function CC.abstract_call_known(

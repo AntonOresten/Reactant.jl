@@ -22,6 +22,8 @@ using LinearAlgebra: svd, lu, qr
 using Libdl: Libdl
 using GPUArraysCore: @allowscalar
 
+const KronModule = isdefined(Base, :kron) ? Base : LinearAlgebra
+
 function __init__()
     if Reactant_jll.is_available()
         libblastrampoline_handle = Libdl.dlopen(BLAS.libblas)
@@ -165,22 +167,21 @@ function ReactantCore.materialize_traced_array(
 end
 
 function TracedUtils.set_mlir_data!(
-    x::Transpose{<:TracedRNumber{T},<:TracedRArray{T,N}}, data
+    x::Transpose{<:TracedRNumber{T},<:AnyTracedRArray{T,N}}, data
 ) where {T,N}
     tdata = TracedRArray{T}(data)
     px = parent(x)
-    px.mlir_data = (
-        if ndims(px) == 1
-            @opcall reshape(tdata, length(tdata))
-        else
-            @opcall transpose(tdata, [2, 1])
-        end
-    ).mlir_data
+    pdata = if ndims(px) == 1
+        @opcall reshape(tdata, length(tdata))
+    else
+        @opcall transpose(tdata, [2, 1])
+    end
+    TracedUtils.set_mlir_data!(px, pdata.mlir_data)
     return x
 end
 
 function TracedUtils.set_mlir_data!(
-    x::Adjoint{<:TracedRNumber{T},<:TracedRArray{T,N}}, data
+    x::Adjoint{<:TracedRNumber{T},<:AnyTracedRArray{T,N}}, data
 ) where {T,N}
     tdata = TracedRArray{T}(data)
     px = parent(x)
@@ -189,7 +190,8 @@ function TracedUtils.set_mlir_data!(
     else
         @opcall(transpose(tdata, [2, 1]))
     end
-    px.mlir_data = (T <: Real ? transposed_data : @opcall(conj(transposed_data))).mlir_data
+    pdata = T <: Real ? transposed_data : @opcall(conj(transposed_data))
+    TracedUtils.set_mlir_data!(px, pdata.mlir_data)
     return x
 end
 
@@ -472,26 +474,26 @@ function LinearAlgebra.ldiv!(
 end
 
 # Kronecker Product
-function LinearAlgebra.kron(
+function KronModule.kron(
     x::Reactant.AnyTracedRVecOrMat{T1}, y::Reactant.AnyTracedRVecOrMat{T2}
 ) where {T1,T2}
     x = materialize_traced_array(x)
     y = materialize_traced_array(y)
     z = similar(x, Base.promote_op(*, T1, T2), LinearAlgebra._kronsize(x, y))
-    LinearAlgebra.kron!(z, x, y)
+    KronModule.kron!(z, x, y)
     return z
 end
 
-function LinearAlgebra.kron(x::AnyTracedRVector{T1}, y::AnyTracedRVector{T2}) where {T1,T2}
+function KronModule.kron(x::AnyTracedRVector{T1}, y::AnyTracedRVector{T2}) where {T1,T2}
     x = materialize_traced_array(x)
     y = materialize_traced_array(y)
     z = similar(x, Base.promote_op(*, T1, T2), length(x) * length(y))
-    LinearAlgebra.kron!(z, x, y)
+    KronModule.kron!(z, x, y)
     return z
 end
 
-function LinearAlgebra.kron!(C::AnyTracedRVector, A::AnyTracedRVector, B::AnyTracedRVector)
-    LinearAlgebra.kron!(
+function KronModule.kron!(C::AnyTracedRVector, A::AnyTracedRVector, B::AnyTracedRVector)
+    KronModule.kron!(
         reshape(C, length(B), length(A)), reshape(A, 1, length(A)), reshape(B, length(B), 1)
     )
     return C

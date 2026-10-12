@@ -292,18 +292,46 @@ function Base.similar(
     ::Broadcasted{AbstractReactantArrayStyle{N}}, ::Type{T}, dims
 ) where {T<:Reactant.ReactantPrimitive,N}
     @assert N isa Int
-    return (@opcall fill(zero(unwrapped_eltype(T)), dims))::TracedRArray{T,N}
+    return similar(TracedRArray{T,N}, dims)
 end
 
 function Base.similar(
     ::Broadcasted{AbstractReactantArrayStyle{N}}, ::Type{<:TracedRNumber{T}}, dims
 ) where {T<:Reactant.ReactantPrimitive,N}
     @assert N isa Int
-    return (@opcall fill(zero(T), dims))::TracedRArray{T,N}
+    return similar(TracedRArray{T,N}, dims)
+end
+
+# Preserve unions through fused broadcasts: joining Bool and TracedRNumber{Bool}
+# to Number loses the primitive type before inferring the outer function.
+broadcast_argtype(x) = eltype(x)
+broadcast_argtype(x::Broadcasted) = broadcast_return_type(x.f, x.args)
+function broadcast_return_type(f, args::Tuple)
+    argtypes = Base.TupleOrBottom(map(broadcast_argtype, args)...)
+    return argtypes === Union{} ? Union{} : Base._return_type(f, argtypes)
+end
+
+# Primitive and traced alternatives with one element type fit the same tensor.
+# Other unions retain the usual broadcast inference and fallback behavior.
+function broadcast_eltype(f, args::Tuple)
+    inferred = broadcast_return_type(f, args)
+    primitive = nothing
+    for T in Base.uniontypes(inferred)
+        if !isconcretetype(T)
+            return Base.promote_typejoin_union(inferred)
+        end
+        element = T <: TracedRNumber ? unwrapped_eltype(T) : T
+        if !(element <: Reactant.ReactantPrimitive) ||
+            (primitive !== nothing && primitive !== element)
+            return Base.promote_typejoin_union(inferred)
+        end
+        primitive = element
+    end
+    return primitive === nothing ? Union{} : primitive
 end
 
 function Base.copy(bc::Broadcasted{<:AbstractReactantArrayStyle{0}})
-    ElType = Broadcast.combine_eltypes(bc.f, bc.args)
+    ElType = broadcast_eltype(bc.f, bc.args)
     dest = copyto!(similar(bc, ElType), bc)
     return dest[CartesianIndex()]  # 0D broadcast needs to unwrap results
 end
@@ -321,7 +349,7 @@ function _copy(bc)
     else
         bc.f
     end
-    ElType = Broadcast.combine_eltypes(fn, bc.args)
+    ElType = broadcast_eltype(fn, bc.args)
     # Special case a union{} return so we can see the better error message
     if ElType === Union{} || ElType == Any || ElType == TracedRNumber
         ElType = Core.Typeof(fn(map(first_scalar, bc.args)...))
