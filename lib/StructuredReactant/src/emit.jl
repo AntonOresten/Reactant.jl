@@ -21,7 +21,6 @@ mutable struct Frame
     const arguments::Vector{Any}   # Argument(n) => arguments[n]; arguments[1] is the callee
     const ssa::Vector{Any}         # SSAValue(id) => ssa[id]
     const blockargs::Vector{Any}   # BlockArgument(id) => blockargs[id]
-    const scratch::Vector{Any}     # call operands; never stored as an emitted value
     const parent::Union{Nothing,Frame}
     pc::Int                        # SSA index being emitted, for diagnostics
     exits::Bool                    # in a general loop body: continue/break yield (done, values...)
@@ -36,7 +35,6 @@ function Frame(
         pack_arguments(code.method, f, args),
         Vector{Any}(undef, sci.max_ssa_idx),
         Vector{Any}(undef, sci.max_arg_idx),
-        Any[],
         parent,
         0,
         false,
@@ -49,7 +47,6 @@ function fork(fr::Frame; exits::Bool=fr.exits)
         copy(fr.arguments),
         copy(fr.ssa),
         copy(fr.blockargs),
-        Any[],
         fr.parent,
         fr.pc,
         exits,
@@ -62,7 +59,6 @@ function reset_frame!(dest::Frame, source::Frame; exits::Bool=source.exits)
     copyto!(dest.arguments, source.arguments)
     copyto!(dest.ssa, source.ssa)
     copyto!(dest.blockargs, source.blockargs)
-    empty!(dest.scratch)
     dest.pc = source.pc
     dest.exits = exits
     return dest
@@ -89,14 +85,6 @@ end
     return x.value
 end
 
-function operands!(fr::Frame, xs::Vector{PreparedOperand})
-    values = resize!(fr.scratch, length(xs))
-    for i in eachindex(xs)
-        values[i] = operand(fr, xs[i])
-    end
-    return values
-end
-
 operand(::Frame, @nospecialize(x)) = x
 operand(fr::Frame, x::Core.SSAValue) = fr.ssa[x.id]
 operand(fr::Frame, x::Core.Argument) = fr.arguments[x.n]
@@ -112,7 +100,7 @@ function operand(::Frame, u::Undef)
     return MissingTracedValue()
 end
 
-operands(fr::Frame, xs) = Tuple(operand(fr, x) for x in xs)
+operands(fr::Frame, xs) = Any[operand(fr, x) for x in xs]
 
 # Tuple traversals that do not specialize on the tuple's type: the emitter meets
 # one argument tuple type per call site of the program, and `any(f, t)` or
@@ -241,15 +229,15 @@ function emit_terminator(fr::Frame, t::PreparedTerminator, k::Union{Nothing,Cont
     if kind === RETURN
         return Returned(operand(fr, t.value))
     elseif kind === YIELD || kind === CONTINUE
-        values = operands!(fr, t.operands)
+        values = operands(fr, t.operands)
         kind === CONTINUE && fr.exits && return Yielded((false, values...))
         yielded = Tuple(values)
         return k === nothing ? Yielded(yielded) : resume(k, fr, yielded)
     elseif kind === BREAK
         fr.exits || unsupported(fr, "`break` outside a general loop")
-        return Yielded((true, operands!(fr, t.operands)...))
+        return Yielded((true, operands(fr, t.operands)...))
     elseif kind === CONDITION
-        return Conditioned(operand(fr, t.value), Tuple(operands!(fr, t.operands)))
+        return Conditioned(operand(fr, t.value), Tuple(operands(fr, t.operands)))
     elseif kind === UNREACHABLE
         unsupported(fr, "code after a call that always throws")
     end
@@ -313,8 +301,8 @@ const SILENT_EXPRESSIONS = (
 function emit_stmt(fr::Frame, p::PreparedStatement, @nospecialize(stmt))
     kind = p.kind
     kind === VALUE && return operand(fr, p.value)
-    kind === CALL && return emit_call(fr, operand(fr, p.value), operands!(fr, p.operands))
-    kind === NEW && return construct(fr, operand(fr, p.value), operands!(fr, p.operands))
+    kind === CALL && return emit_call(fr, operand(fr, p.value), operands(fr, p.operands))
+    kind === NEW && return construct(fr, operand(fr, p.value), operands(fr, p.operands))
     return emit_stmt(fr, stmt)
 end
 

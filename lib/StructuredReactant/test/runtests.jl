@@ -536,8 +536,8 @@ end
         varargs(x, ys...) = sum(x) > 0.0f0 ? x + ys[1] : x - ys[end]
         @test agrees(varargs, (x, y, x), (y, y, x))
 
-        # Calls of different arities and nested activations must not overwrite
-        # tuples returned by earlier calls through the same scratch buffer.
+        # Calls of different arities and nested activations keep the tuples that
+        # earlier calls returned.
         Base.@noinline saved_args(xs...) = xs
         no_args() = 4.0f0
         function retained_args(x)

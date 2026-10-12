@@ -195,7 +195,7 @@ struct LoopBody end
 # iteration also supplies a carry whose dead initializer Julia dropped.
 function emit_loop(fr::Frame, op::ForOp)
     has_return(fr, op) && unsupported(fr, "`return` inside a loop")
-    carries = operands(fr, op.init_values)
+    carries = Tuple(operands(fr, op.init_values))
     lower, upper, step = operand(fr, op.lower), operand(fr, op.upper), operand(fr, op.step)
     if lower isa Integer && upper isa Integer && step isa Integer
         step > 0 || unsupported(fr, "a counted loop with a non-positive step")
@@ -238,7 +238,7 @@ end
 
 function emit_loop(fr::Frame, op::WhileOp)
     has_return(fr, op) && unsupported(fr, "`return` inside a loop")
-    carries = operands(fr, op.init_values)
+    carries = Tuple(operands(fr, op.init_values))
     unrolled = Unrolled(fr)
     body_frame = fork(fr; exits=false)
     while true
@@ -294,7 +294,7 @@ end
 # A general loop exits only through `break`, so its body runs at least once; once
 # rolled, its first carry is the `done` flag.
 function emit_loop(fr::Frame, op::LoopOp)
-    carries = operands(fr, op.init_values)
+    carries = Tuple(operands(fr, op.init_values))
     k = counted_range(fr, op)
     k != 0 && carries[k] isa Iteration && return roll_counted(fr, op, k, carries)
     host = iterates_host_collection(fr, op)
@@ -628,7 +628,7 @@ function continued(fr::Frame, op::LoopOp, @nospecialize(carries::Tuple))
         fr.ssa[idx] = emit_stmt(fr, prepared.statements[position], body.stmts[position])
     end
     yielded = fr.code.blocks[last(body.stmts).then_region].terminator
-    return Tuple(operands!(fr, yielded.operands))
+    return Tuple(operands(fr, yielded.operands))
 end
 
 # iterating a traced range
