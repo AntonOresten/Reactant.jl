@@ -8,6 +8,16 @@ using Reactant, Test
     @test Array{Int64}(@jit(i:j)) == collect(5:10)
 end
 
+select_from_range(r, i) = r[i]
+
+@testset "indexing a range with traced endpoints" begin
+    r = 2:5
+    r_ra = Reactant.to_rarray(r; track_numbers=true)
+    for i in (2:3, 1:2:3, Base.OneTo(2), [4, 2], [4 2])
+        @test Array(@jit(select_from_range(r_ra, i))) == r[i]
+    end
+end
+
 broadcast_over_range(a, kx, ky) = a .* (kx .^ 2 .+ ky' .^ 2)
 
 @testset "broadcast over ranges" begin

@@ -317,7 +317,7 @@ end
 # TODO(#2237): some of these dispatches can be optimized
 for idxtype in (AbstractArray, AbstractUnitRange{<:Integer}, StepRange{<:Integer})
     @eval function Base.getindex(v::TracedUnitRange{T}, i::$idxtype) where {T}
-        return getindex(Reactant.promote_to(TracedRArray{T,1}, v), i)
+        return getindex(Reactant.promote_to(TracedRArray{unwrapped_eltype(v),1}, v), i)
     end
 end
 
