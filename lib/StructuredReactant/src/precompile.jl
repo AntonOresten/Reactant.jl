@@ -25,7 +25,7 @@ using PrecompileTools: @setup_workload, @compile_workload
         if Reactant.Reactant_jll.is_available()
             x = Reactant.to_rarray(Float32[1, 2])
             n = Reactant.ConcreteRNumber(3)
-            Reactant.@code_hlo optimize=false structured(workload)(x, n)
+            Reactant.@code_hlo optimize = false structured(workload)(x, n)
         end
     end
     # Resolutions hold this process's worlds; CodeInstances carry their prepared code.

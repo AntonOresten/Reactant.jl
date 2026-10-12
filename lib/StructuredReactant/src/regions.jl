@@ -130,8 +130,7 @@ function fill_dead_slots(
     return ntuple(length(values)) do k
         missing(k) || return values[k]
         j = findfirst(eachindex(values)) do j
-            return T.parameters[j] === T.parameters[k] &&
-                   !(values[j] isa MissingTracedValue)
+            return T.parameters[j] === T.parameters[k] && !(values[j] isa MissingTracedValue)
         end
         return j === nothing ? values[k] : values[j]
     end
@@ -245,9 +244,9 @@ function emit_loop(fr::Frame, op::WhileOp)
         bind!(fr, op.before.args, carries)
         outcome = emit_block(fr, op.before)
         outcome isa Conditioned || unsupported(fr, "a loop condition that does not yield")
-        outcome.condition isa Bool &&
-        (!tuple_any(has_traced, outcome.values) || !tuple_all(rollable, outcome.values)) ||
-            break
+        outcome.condition isa Bool && (
+            !tuple_any(has_traced, outcome.values) || !tuple_all(rollable, outcome.values)
+        ) || break
         outcome.condition || return outcome.values
         carries = iteration(fr, op.after, outcome.values, body_frame)
         count!(unrolled)

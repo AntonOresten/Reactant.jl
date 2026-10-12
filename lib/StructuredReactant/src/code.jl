@@ -70,7 +70,10 @@ end
 
 # The CodeInstance of `mi` and its structured IR, built once per CodeInstance.
 function prepared_code(
-    interp::Interpreter, match::Core.MethodMatch, mi::Core.MethodInstance, @nospecialize(sig)
+    interp::Interpreter,
+    match::Core.MethodMatch,
+    mi::Core.MethodInstance,
+    @nospecialize(sig)
 )
     cache = CacheView{PreparedCode}(CC.cache_owner(interp), interp.world)
     ci = get(cache, mi, nothing)

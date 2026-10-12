@@ -835,7 +835,7 @@ end
 
         # A short-circuit right-hand side is emitted inside its guard's region:
         # the division sits deeper than the `if` in `main`.
-        guarded(x) = (s=sum(x); s > 0.0f0 && sum(x ./ s) > 0.5f0) ? x : -x
+        guarded(x) = (s = sum(x); s > 0.0f0 && sum(x ./ s) > 0.5f0) ? x : -x
         @test agrees(guarded, (x,), (-x,), (Float32[0.1, 0.1, 0.1],))
         lines = split(unoptimized(guarded, x), '\n')
         indent(l) = length(l) - length(lstrip(l))
