@@ -621,10 +621,11 @@ function continued(fr::Frame, op::LoopOp, @nospecialize(carries::Tuple))
     fr = fork(fr; exits=false)
     bind!(fr, op.body.args, carries)
     body = op.body.body
+    prepared = fr.code.blocks[op.body]
     for position in 1:(length(body.stmts) - 1)
         idx = body.ssa_idxes[position]
         fr.pc = idx
-        fr.ssa[idx] = emit_stmt(fr, fr.code.blocks[op.body].statements[position])
+        fr.ssa[idx] = emit_stmt(fr, prepared.statements[position], body.stmts[position])
     end
     yielded = fr.code.blocks[last(body.stmts).then_region].terminator
     return Tuple(operands!(fr, yielded.operands))

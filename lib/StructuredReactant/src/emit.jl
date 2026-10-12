@@ -226,12 +226,12 @@ function emit_block(
     prepared = fr.code.blocks[block]
     for position in from:length(body.ssa_idxes)
         idx = body.ssa_idxes[position]
-        stmt = prepared.statements[position]
+        stmt = body.stmts[position]
         fr.pc = idx
-        if stmt.returns || (fr.exits && stmt.exits)
-            return emit_if(fr, stmt.value.value::IfOp, Continuation(block, position, k))
+        if stmt isa IfOp && (has_return(fr, stmt) || (fr.exits && exits_loop(fr, stmt)))
+            return emit_if(fr, stmt, Continuation(block, position, k))
         end
-        fr.ssa[idx] = emit_stmt(fr, stmt)
+        fr.ssa[idx] = emit_stmt(fr, prepared.statements[position], stmt)
     end
     return emit_terminator(fr, prepared.terminator, k)
 end
@@ -256,9 +256,7 @@ function emit_terminator(fr::Frame, t::PreparedTerminator, k::Union{Nothing,Cont
     return unsupported(fr, "a block without a terminator")
 end
 
-# Both predicates are memoized in the frame's `Code`: a block is emitted once
-# per call and per unrolled iteration, and scanning its nested regions each
-# time dominated the emission of larger programs.
+# Memoized in the `Code`: a block is emitted once per call and unrolled iteration.
 has_return(fr::Frame, op::ControlFlowOp) = has_return(fr.code.returns, op)
 function has_return(memo::IdDict{Any,Bool}, op::ControlFlowOp)
     return get!(memo, op) do
@@ -312,14 +310,12 @@ const SILENT_EXPRESSIONS = (
     :popaliasscope,
 )
 
-function emit_stmt(fr::Frame, stmt::PreparedStatement)
-    kind = stmt.kind
-    kind === VALUE && return operand(fr, stmt.value)
-    kind === CALL &&
-        return emit_call(fr, operand(fr, stmt.value), operands!(fr, stmt.operands))
-    kind === NEW &&
-        return construct(fr, operand(fr, stmt.value), operands!(fr, stmt.operands))
-    return emit_stmt(fr, stmt.value.value)
+function emit_stmt(fr::Frame, p::PreparedStatement, @nospecialize(stmt))
+    kind = p.kind
+    kind === VALUE && return operand(fr, p.value)
+    kind === CALL && return emit_call(fr, operand(fr, p.value), operands!(fr, p.operands))
+    kind === NEW && return construct(fr, operand(fr, p.value), operands!(fr, p.operands))
+    return emit_stmt(fr, stmt)
 end
 
 function emit_stmt(fr::Frame, ex::Expr)

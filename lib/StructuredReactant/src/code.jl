@@ -3,22 +3,20 @@ struct Code
     sci::StructuredIRCode
     method::Method
     sparams::Core.SimpleVector
+    blocks::IdDict{Block,PreparedBlock}
     # Memoized per control-flow op: does it return, does it leave the loop.
     returns::IdDict{Any,Bool}
     exits::IdDict{Any,Bool}
-    blocks::IdDict{Block,PreparedBlock}
 end
 function Code(sci, method, sparams)
-    returns, exits = IdDict{Any,Bool}(), IdDict{Any,Bool}()
-    return Code(sci, method, sparams, returns, exits, prepare(sci, returns, exits))
+    return Code(sci, method, sparams, prepare(sci), IdDict{Any,Bool}(), IdDict{Any,Bool}())
 end
 
-# Attached to Julia's CodeInstance, so dependencies invalidate inferred source
-# and prepared code together. Execution buffers belong to Frames, never here.
+# Attached to the CodeInstance, so it is invalidated with the inferred source.
 mutable struct PreparedCode
     code::Union{Nothing,Code}
-    PreparedCode() = new(nothing)
 end
+PreparedCode() = PreparedCode(nothing)
 
 # Dispatch is cached only within one world: a newly added overload can select a
 # different MethodInstance without invalidating the previously selected one.
